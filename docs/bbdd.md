@@ -1,0 +1,645 @@
+# Base de Datos — 40dB
+
+Este documento define el **modelo de datos canónico** del backend 40dB: DDL, índices, triggers, función de validación (RPC), estrategia de RLS y máquina de estados del reporte. Es la referencia que `supabase/migrations/*` debe reflejar.
+
+> **Nota:** este doc reemplaza cualquier suposición previa de modelo de datos en `backend.md`. Si difieren, manda este.
+
+---
+
+## 1. Decisiones de diseño
+
+| # | Decisión | Justificación |
+|---|---|---|
+| D1 | **PostGIS habilitado** con columna `ubicacion geography(Point, 4326)` generada desde `latitud`/`longitud` | Query crítico (validación geo-temporal) usa `ST_DWithin` con índice GIST — orden de magnitud más rápido que haversine en SQL y estándar en Supabase. |
+| D2 | **Validación IoT 1:1** para prototipo: `reporte.lectura_evidencia_id` apunta a una `lectura` única | El prototipo tendrá un solo micrófono. N:M con `score` queda como **roadmap** (sección 10) cuando se sumen sensores y validaciones manuales. |
+| D3 | **Estado del reporte como historial append-only** (`historial_estado`) | Auditoría completa: quién cambió a qué, cuándo y por qué. Estado actual = último row por `reporte_id` (índice compuesto lo hace barato). |
+| D4 | **RLS habilitada sin políticas** | Todo el tráfico pasa por FastAPI con `service_role_key`. El frontend **nunca** habla con Supabase directo. Bypass por diseño, no por descuido. |
+| D5 | **lat/lng numéricos se mantienen** como columnas fuente; `ubicacion` es `GENERATED STORED` | Source of truth humano-legible. La columna PostGIS se deriva, no se duplica manualmente. |
+| D6 | **FK a `lectura` (no a `sensor`) para evidencia** | `lectura_evidencia_id bigint REFERENCES lectura(id) ON DELETE SET NULL`. Navegamos sensor + dB + timestamp por JOIN sin desnormalizar. |
+| D7 | **Catálogos pequeños como tablas, no enums** | `comuna`, `tipo_estado`. Permite agregar valores sin migración y referenciarlos por FK. |
+
+---
+
+## 2. Diagrama lógico (ERD textual)
+
+```
+auth.users (Supabase)
+   ▲ 1:1
+   │
+usuario ─── pertenece a ──▶ comuna
+   │                          ▲
+   │ 1:N                      │ 1:N
+   ▼                          │
+reporte ─── ubicado en ───────┘
+   │  ▲ (atendido_por_id, opcional)
+   │  └─── usuario (tipo='municipalidad')
+   │
+   │ 1:N                              evidencia (1:1)
+   ▼                                       │
+historial_estado ──▶ tipo_estado           ▼
+   ▲                                    lectura ──▶ sensor ──▶ comuna
+   │ FK usuario_id (quién hizo el cambio)
+```
+
+**Cardinalidades clave:**
+- `usuario` 1—N `reporte` (autor) y opcional 1—N `reporte` (atendido_por).
+- `reporte` 1—N `historial_estado`; estado actual = `MAX(created_at)`.
+- `sensor` 1—N `lectura`.
+- `reporte` 0..1—1 `lectura` vía `lectura_evidencia_id` (validación 1:1 del prototipo).
+
+---
+
+## 3. DDL canónico
+
+> El SQL real vive en `supabase/migrations/*`. Esta sección documenta el **estado objetivo**. Cuando se ratifique este doc, se actualizará la migración o se creará una nueva.
+
+### 3.1 Extensiones
+
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+-- pgcrypto es parte de Supabase por default (provee gen_random_uuid)
+```
+
+### 3.2 Catálogos
+
+```sql
+CREATE TABLE comuna (
+  id      int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre  text NOT NULL UNIQUE,
+  region  text,
+  codigo  text UNIQUE
+);
+
+CREATE TABLE tipo_estado (
+  id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nombre      text NOT NULL UNIQUE,
+  descripcion text,
+  orden       int NOT NULL DEFAULT 0
+);
+```
+
+### 3.3 Usuario (perfil sobre `auth.users`)
+
+```sql
+CREATE TABLE usuario (
+  id          uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  nombre      text NOT NULL,
+  telefono    text,
+  tipo        text NOT NULL DEFAULT 'ciudadano'
+              CHECK (tipo IN ('ciudadano', 'municipalidad')),
+  comuna_id   int REFERENCES comuna(id),
+  activo      boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_usuario_tipo ON usuario(tipo);
+```
+
+El detalle de auth (trigger `handle_new_user`, OAuth, JWT) está en `auth.md`.
+
+### 3.4 Sensor
+
+```sql
+CREATE TABLE sensor (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  comuna_id   int NOT NULL REFERENCES comuna(id),
+  nombre      text NOT NULL UNIQUE,
+  latitud     numeric(10, 8) NOT NULL,
+  longitud    numeric(11, 8) NOT NULL,
+  ubicacion   geography(Point, 4326)
+              GENERATED ALWAYS AS (
+                ST_SetSRID(ST_MakePoint(longitud, latitud), 4326)::geography
+              ) STORED,
+  activo      boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_sensor_comuna    ON sensor(comuna_id);
+CREATE INDEX idx_sensor_ubicacion ON sensor USING GIST (ubicacion);
+```
+
+### 3.5 Lectura (telemetría IoT)
+
+```sql
+CREATE TABLE lectura (
+  id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sensor_id           uuid NOT NULL REFERENCES sensor(id) ON DELETE CASCADE,
+  nivel_db            numeric(5, 2) NOT NULL,
+  timestamp_medicion  timestamptz NOT NULL,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  -- Idempotencia ante QoS 1 / reintentos del sensor (ver iot.md §6.3)
+  CONSTRAINT uq_lectura_sensor_timestamp UNIQUE (sensor_id, timestamp_medicion)
+);
+
+-- Heatmap (filtro temporal puro) + matching IoT (sensor+ventana)
+CREATE INDEX idx_lectura_timestamp        ON lectura(timestamp_medicion);
+CREATE INDEX idx_lectura_sensor_timestamp ON lectura(sensor_id, timestamp_medicion);
+```
+
+### 3.6 Reporte
+
+```sql
+CREATE TABLE reporte (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id            uuid NOT NULL REFERENCES usuario(id),
+  atendido_por_id       uuid REFERENCES usuario(id),
+  comuna_id             int  NOT NULL REFERENCES comuna(id),
+  titulo                text NOT NULL,
+  descripcion           text NOT NULL,
+  latitud               numeric(10, 8) NOT NULL,
+  longitud              numeric(11, 8) NOT NULL,
+  ubicacion             geography(Point, 4326)
+                        GENERATED ALWAYS AS (
+                          ST_SetSRID(ST_MakePoint(longitud, latitud), 4326)::geography
+                        ) STORED,
+  -- Evidencia IoT (prototipo 1:1, ver roadmap para N:M)
+  lectura_evidencia_id  bigint REFERENCES lectura(id) ON DELETE SET NULL,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_reporte_usuario      ON reporte(usuario_id);
+CREATE INDEX idx_reporte_comuna       ON reporte(comuna_id);
+CREATE INDEX idx_reporte_atendido_por ON reporte(atendido_por_id)
+  WHERE atendido_por_id IS NOT NULL;
+CREATE INDEX idx_reporte_ubicacion    ON reporte USING GIST (ubicacion);
+```
+
+### 3.7 Historial de estados
+
+```sql
+CREATE TABLE historial_estado (
+  id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  reporte_id      uuid NOT NULL REFERENCES reporte(id) ON DELETE CASCADE,
+  tipo_estado_id  int  NOT NULL REFERENCES tipo_estado(id),
+  usuario_id      uuid REFERENCES usuario(id),     -- quién hizo el cambio
+  comentario      text,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+-- CRÍTICO: obtener "último estado por reporte" es O(log n) con este índice
+CREATE INDEX idx_historial_reporte_created
+  ON historial_estado(reporte_id, created_at DESC);
+```
+
+---
+
+## 4. Triggers
+
+### 4.1 `handle_new_user` — auto-provisioning de perfil
+Cuando llega un `INSERT` a `auth.users` (login Google/email), crea automáticamente el row en `usuario`. Detalle completo en `auth.md`.
+
+### 4.2 `set_initial_estado` — estado inicial automático
+Cuando se inserta un `reporte`, mete "En espera" en `historial_estado` sin que el código Python tenga que recordarlo. Garantiza invariante: **todo reporte tiene al menos un estado**.
+
+```sql
+CREATE OR REPLACE FUNCTION public.set_initial_estado()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE v_estado_id int;
+BEGIN
+  SELECT id INTO v_estado_id FROM public.tipo_estado WHERE nombre = 'En espera' LIMIT 1;
+  IF v_estado_id IS NULL THEN
+    RAISE EXCEPTION 'tipo_estado "En espera" no existe en el catalogo';
+  END IF;
+  INSERT INTO public.historial_estado (reporte_id, tipo_estado_id, usuario_id)
+  VALUES (NEW.id, v_estado_id, NEW.usuario_id);
+  RETURN NEW;
+END; $$;
+
+CREATE TRIGGER on_reporte_created
+AFTER INSERT ON public.reporte
+FOR EACH ROW EXECUTE FUNCTION public.set_initial_estado();
+```
+
+### 4.3 `set_updated_at` — mantenimiento de `updated_at`
+Aplicado a `usuario`, `reporte`, `sensor`. Evita olvidos en UPDATEs manuales.
+
+---
+
+## 5. RPCs (funciones Postgres)
+
+Cuatro funciones PL/pgSQL viven en la DB. Todas se invocan desde Python con `supabase_client.rpc(<nombre>, params)`:
+
+| Función | Para qué | Llamada desde |
+|---|---|---|
+| `validar_reporte_ruido` | Single-match para preview | `GET /reportes/buscar-evidencia` |
+| `validar_reporte_ruido_top_n` | Top-N para anti-forgery | (interno, dentro de §5.3) |
+| `crear_reporte_con_validacion` | Insert + validación atómica | `POST /reportes` |
+| `heatmap_agregado` | Agregación por celda + bucket | `GET /heatmaps` |
+
+Las tres primeras encapsulan **reglas de negocio** (criterios geo-temporales, transiciones del modelo, atomicidad). La cuarta es **agregación pura** sobre `lectura` — vive como función Postgres porque `supabase-py` no expone SQL raw parametrizado, no por encapsulamiento de reglas. La alternativa sería `psycopg2` + `POSTGRES_URL`, descartada por agregar un cliente y un path de credenciales paralelos para un solo query.
+
+### 5.1 `validar_reporte_ruido` (single, para preview)
+
+**Parámetros de diseño** (configurables vía signature):
+- Radio: 100 m (default)
+- Ventana retrospectiva: 10 minutos
+- Umbral mínimo: 65 dB
+
+```sql
+CREATE OR REPLACE FUNCTION public.validar_reporte_ruido(
+  p_latitud         double precision,
+  p_longitud        double precision,
+  p_tiempo_reporte  timestamptz,
+  p_radio_metros    int     DEFAULT 100,
+  p_umbral_db       numeric DEFAULT 65,
+  p_ventana_minutos int     DEFAULT 10
+)
+RETURNS TABLE (
+  lectura_id          bigint,
+  sensor_id           uuid,
+  nivel_db            numeric,
+  timestamp_medicion  timestamptz,
+  distancia_metros    double precision
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    l.id,
+    l.sensor_id,
+    l.nivel_db,
+    l.timestamp_medicion,
+    ST_Distance(
+      s.ubicacion,
+      ST_SetSRID(ST_MakePoint(p_longitud, p_latitud), 4326)::geography
+    ) AS distancia_metros
+  FROM lectura l
+  JOIN sensor s ON s.id = l.sensor_id
+  WHERE s.activo = true
+    AND ST_DWithin(
+          s.ubicacion,
+          ST_SetSRID(ST_MakePoint(p_longitud, p_latitud), 4326)::geography,
+          p_radio_metros
+        )
+    AND l.timestamp_medicion >= p_tiempo_reporte - make_interval(mins => p_ventana_minutos)
+    AND l.timestamp_medicion <= p_tiempo_reporte
+    AND l.nivel_db >= p_umbral_db
+  ORDER BY l.nivel_db DESC, l.timestamp_medicion DESC
+  LIMIT 1;
+END; $$;
+```
+
+**Uso:** la invoca `GET /reportes/buscar-evidencia` (preview iniciado por el usuario). No escribe nada. Para el insert se usa la compuesta (§5.3).
+
+### 5.2 `validar_reporte_ruido_top_n` (top-N, para anti-forgery)
+
+Variante que retorna las top-N lecturas que cumplen los criterios (no solo la mejor). Se usa dentro de `crear_reporte_con_validacion` para confirmar que el `lectura_evidencia_id` enviado por el cliente pertenece al set legítimo de candidatos.
+
+```sql
+CREATE OR REPLACE FUNCTION public.validar_reporte_ruido_top_n(
+  p_latitud         double precision,
+  p_longitud        double precision,
+  p_tiempo_reporte  timestamptz,
+  p_top_n           int     DEFAULT 5,
+  p_radio_metros    int     DEFAULT 100,
+  p_umbral_db       numeric DEFAULT 65,
+  p_ventana_minutos int     DEFAULT 10
+)
+RETURNS TABLE (
+  lectura_id          bigint,
+  sensor_id           uuid,
+  nivel_db            numeric,
+  timestamp_medicion  timestamptz,
+  distancia_metros    double precision
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  SELECT l.id, l.sensor_id, l.nivel_db, l.timestamp_medicion,
+    ST_Distance(
+      s.ubicacion,
+      ST_SetSRID(ST_MakePoint(p_longitud, p_latitud), 4326)::geography
+    )
+  FROM lectura l
+  JOIN sensor  s ON s.id = l.sensor_id
+  WHERE s.activo = true
+    AND ST_DWithin(
+          s.ubicacion,
+          ST_SetSRID(ST_MakePoint(p_longitud, p_latitud), 4326)::geography,
+          p_radio_metros)
+    AND l.timestamp_medicion BETWEEN p_tiempo_reporte - make_interval(mins => p_ventana_minutos)
+                                 AND p_tiempo_reporte
+    AND l.nivel_db >= p_umbral_db
+  ORDER BY l.nivel_db DESC, l.timestamp_medicion DESC
+  LIMIT p_top_n;
+END; $$;
+```
+
+### 5.3 `crear_reporte_con_validacion` (compuesta, atómica — usada por POST)
+
+Envuelve insert + validación + fallback en una sola transacción. Lo invoca el backend en `POST /reportes`. Si algo falla, la transacción se revierte completa (incluyendo el `historial_estado` que insertó el trigger).
+
+```sql
+CREATE OR REPLACE FUNCTION public.crear_reporte_con_validacion(
+  p_usuario_id            uuid,
+  p_comuna_id             int,
+  p_titulo                text,
+  p_descripcion           text,
+  p_latitud               double precision,
+  p_longitud              double precision,
+  p_lectura_evidencia_id  bigint DEFAULT NULL
+)
+RETURNS TABLE (
+  reporte_id            uuid,
+  lectura_evidencia_id  bigint
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_reporte_id  uuid;
+  v_evidencia   bigint;
+  v_now         timestamptz := now();
+BEGIN
+  -- 1. Insertar el reporte (trigger set_initial_estado agrega "En espera")
+  INSERT INTO reporte (usuario_id, comuna_id, titulo, descripcion, latitud, longitud)
+  VALUES (p_usuario_id, p_comuna_id, p_titulo, p_descripcion, p_latitud, p_longitud)
+  RETURNING id INTO v_reporte_id;
+
+  -- 2. Si el cliente envió un id, verificarlo (anti-forgery + staleness)
+  IF p_lectura_evidencia_id IS NOT NULL THEN
+    SELECT lectura_id INTO v_evidencia
+    FROM validar_reporte_ruido_top_n(p_latitud, p_longitud, v_now, 5)
+    WHERE lectura_id = p_lectura_evidencia_id
+    LIMIT 1;
+  END IF;
+
+  -- 3. Si no se adjuntó nada en el paso 2, intentar fallback automático
+  IF v_evidencia IS NULL THEN
+    SELECT lectura_id INTO v_evidencia
+    FROM validar_reporte_ruido(p_latitud, p_longitud, v_now)
+    LIMIT 1;
+  END IF;
+
+  -- 4. Adjuntar la evidencia (si la hay)
+  IF v_evidencia IS NOT NULL THEN
+    UPDATE reporte SET lectura_evidencia_id = v_evidencia WHERE id = v_reporte_id;
+  END IF;
+
+  RETURN QUERY SELECT v_reporte_id, v_evidencia;
+END; $$;
+```
+
+**Por qué RPC compuesta y no transacción desde Python.** Un solo roundtrip a Postgres, atomicidad implícita garantizada por la DB, lógica de fallback testeable como unidad en SQL (con `pgTAP` o tests de integración), y el backend Python queda como orquestador delgado que solo mapea el resultado. Decisión cerrada (antes era "pendiente de discusión").
+
+### 5.4 `heatmap_agregado` (agregación geo-temporal)
+
+Función Postgres que agrega `lectura` por celda + bucket temporal. La invoca `LecturaRepository.heatmap(...)` via `rpc()`. A diferencia de §5.1–§5.3, **no encapsula reglas de negocio** — es agregación pura. Vive como función Postgres porque `supabase-py` no expone SQL raw parametrizado.
+
+```sql
+CREATE OR REPLACE FUNCTION public.heatmap_agregado(
+  p_min_lng        double precision,
+  p_min_lat        double precision,
+  p_max_lng        double precision,
+  p_max_lat        double precision,
+  p_time_start     timestamptz,
+  p_time_end       timestamptz,
+  p_bucket_minutes int,
+  p_grid_size_deg  double precision DEFAULT 0.001
+)
+RETURNS TABLE (
+  lng_cell      double precision,
+  lat_cell      double precision,
+  bucket_start  timestamptz,
+  nivel_db_avg  numeric,
+  nivel_db_max  numeric,
+  lectura_count bigint
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  -- Las columnas internas del CTE usan prefijo _ para no colisionar con las
+  -- columnas del RETURNS TABLE (PL/pgSQL trata éstas como variables y
+  -- entraría en ambigüedad en el GROUP BY).
+  RETURN QUERY
+  WITH celdas AS (
+    SELECT
+      (round((s.longitud / p_grid_size_deg)::numeric) * p_grid_size_deg)::double precision AS _lng_cell,
+      (round((s.latitud  / p_grid_size_deg)::numeric) * p_grid_size_deg)::double precision AS _lat_cell,
+      date_bin(
+        make_interval(mins => p_bucket_minutes),
+        l.timestamp_medicion,
+        '2000-01-01'::timestamptz
+      ) AS _bucket_start,
+      l.nivel_db AS _nivel_db
+    FROM lectura l
+    JOIN sensor  s ON s.id = l.sensor_id
+    WHERE l.timestamp_medicion >= p_time_start
+      AND l.timestamp_medicion <  p_time_end
+      AND s.longitud BETWEEN p_min_lng AND p_max_lng
+      AND s.latitud  BETWEEN p_min_lat AND p_max_lat
+  )
+  SELECT
+    celdas._lng_cell,
+    celdas._lat_cell,
+    celdas._bucket_start,
+    ROUND(AVG(celdas._nivel_db)::numeric, 2),
+    MAX(celdas._nivel_db),
+    COUNT(*)
+  FROM celdas
+  GROUP BY celdas._lng_cell, celdas._lat_cell, celdas._bucket_start
+  ORDER BY celdas._bucket_start, celdas._lat_cell, celdas._lng_cell;
+END;
+$$;
+```
+
+**Notas:**
+- Usa `date_bin` (Postgres 14+) para alinear buckets a un origen fijo (`2000-01-01`), garantizando que dos requests con misma ventana produzcan los mismos buckets.
+- El filtro por bbox usa `sensor.latitud/longitud` numéricos, no PostGIS — más simple y barato para un bounding box rectangular. PostGIS se usa solo en §5.1–§5.2 (radio geodésico).
+- El `0.001°` (~100 m al ecuador, menos a latitudes altas) viene de `settings.HEATMAP_GRID_SIZE_DEG`.
+- La validación de límites (`bucket_minutes ∈ {1,5,15,60}`, ventana ≤ 7 días, bbox válido) vive en el use case Python (`app/application/obtener_heatmap.py`), no en SQL — son reglas de **dominio del endpoint**, no de la agregación.
+
+---
+
+## 6. Row Level Security (RLS)
+
+### Estrategia: enabled, sin políticas
+Todas las tablas tienen RLS activado **sin políticas**, lo que significa que ningún rol cliente (`anon`, `authenticated`) puede leer ni escribir directamente. **El backend usa `service_role_key`** que bypasa RLS por diseño.
+
+```sql
+ALTER TABLE comuna           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tipo_estado      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usuario          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reporte          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE historial_estado ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sensor           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lectura          ENABLE ROW LEVEL SECURITY;
+```
+
+**Implicaciones:**
+- El frontend Vue 3 **nunca** debe usar el cliente JS de Supabase directo — todo HTTP pasa por FastAPI.
+- La `service_role_key` **nunca** se expone al cliente. Vive solo en backend (env var).
+- Si en el futuro se decide exponer Supabase al frontend (ej. para auth con SDK), se diseñarán políticas explícitas. Detalle en `auth.md`.
+
+---
+
+## 7. Máquina de estados del reporte
+
+Estados (orden lógico, no jerárquico):
+
+```
+       ┌─────────────┐
+       │  En espera  │  ◀── creado por usuario
+       └──────┬──────┘
+              │  (funcionario asigna)
+              ▼
+       ┌─────────────┐
+       │ En atencion │
+       └──────┬──────┘
+              │
+        ┌─────┴─────┐
+        ▼           ▼
+   ┌─────────┐ ┌────────────┐
+   │ Atendido │ │ Descartado │
+   └─────────┘ └────────────┘
+```
+
+| Estado | Quién lo asigna | Cuándo |
+|---|---|---|
+| `En espera` | Trigger automático | Al crear el reporte |
+| `En atencion` | Usuario `municipalidad` | Cuando toma el caso (`atendido_por_id` se setea) |
+| `Atendido` | Usuario `municipalidad` | Cuando resuelve |
+| `Descartado` | Usuario `municipalidad` | Si es inválido/duplicado |
+
+**Reglas (a aplicar en capa de aplicación, no en DB):**
+- Solo usuarios `tipo='municipalidad'` pueden insertar transiciones distintas a "En espera".
+- No se puede saltar de "En espera" → "Atendido" sin pasar por "En atencion" (validación en use case, no en SQL).
+- El comentario es obligatorio en transiciones a `Descartado`.
+
+---
+
+## 8. Seed de desarrollo
+
+Vive en `supabase/seed.sql` y se ejecuta con `supabase db reset`. Contiene:
+- 3 comunas (Santiago, Providencia, Las Condes).
+- 3 usuarios mock (2 ciudadanos + 1 funcionario municipal).
+- 3 sensores en distintas comunas.
+- Lecturas variadas (algunas sobre el umbral, otras debajo) para probar matching IoT.
+- 3 reportes en distintos estados.
+- ⚠️ El seed actual aún referencia `validacion_iot` (modelo N:M descartado). **Hay que actualizarlo** cuando se aplique el cambio al modelo 1:1.
+
+---
+
+## 9. Índices: justificación una a una
+
+| Índice | Para qué query |
+|---|---|
+| `idx_usuario_tipo` | Filtrar funcionarios municipales (panel admin). |
+| `idx_sensor_comuna` | Listar sensores por comuna (mantenimiento, dashboards). |
+| `idx_sensor_ubicacion` (GIST) | `ST_DWithin` en RPC de validación. **Crítico**. |
+| `idx_lectura_timestamp` | Heatmap por ventana temporal sin filtro de sensor. |
+| `idx_lectura_sensor_timestamp` | Matching IoT (sensor + ventana). **Crítico para RPC**. |
+| `idx_reporte_usuario` | "Mis reportes" del ciudadano. |
+| `idx_reporte_comuna` | Lista de reportes por comuna (panel funcionario). |
+| `idx_reporte_atendido_por` (parcial) | "Casos asignados a mí" del funcionario. |
+| `idx_reporte_ubicacion` (GIST) | Heatmap geoespacial agrupado. |
+| `idx_historial_reporte_created` | Obtener estado actual de un reporte (`ORDER BY created_at DESC LIMIT 1`). **Crítico**. |
+
+---
+
+## 10. Roadmap del modelo
+
+Cambios postergados pero documentados para no perderlos:
+
+### 10.1 Validación IoT N:M (cuando crezcan los sensores)
+
+Reintroducir tabla asociativa:
+
+```sql
+CREATE TABLE validacion_iot (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  reporte_id  uuid    NOT NULL REFERENCES reporte(id) ON DELETE CASCADE,
+  lectura_id  bigint  NOT NULL REFERENCES lectura(id) ON DELETE CASCADE,
+  score       numeric(3, 2) NOT NULL CHECK (score BETWEEN 0 AND 1),
+  metodo      text NOT NULL DEFAULT 'automatico'
+              CHECK (metodo IN ('automatico', 'manual')),
+  usuario_id  uuid REFERENCES usuario(id),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (reporte_id, lectura_id)
+);
+```
+
+Migración: `reporte.lectura_evidencia_id` se preserva (denota validación principal) o se descarta migrando los rows existentes a la tabla nueva.
+
+### 10.2 Políticas RLS para acceso desde cliente
+Si en algún momento el frontend lee Supabase directo (ej. real-time subscriptions para heatmap), diseñar políticas:
+- `comuna`, `tipo_estado` → SELECT público (catálogos).
+- `reporte` → SELECT propio (`auth.uid() = usuario_id`) o municipal de la misma comuna.
+- `lectura` → SELECT público (data acústica anónima, agregada).
+
+### 10.3 Particionamiento de `lectura`
+Cuando `lectura` supere ~10M de rows, particionar por mes (`PARTITION BY RANGE (timestamp_medicion)`). El índice `idx_lectura_sensor_timestamp` ya está alineado con el patrón de query, así que solo hay que aplicar el `PARTITION BY` al crear la tabla.
+
+### 10.4 Vista materializada para heatmap
+Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios por celda H3/geohash + bucket de 5 minutos. Refresh incremental on-demand o vía pg_cron.
+
+---
+
+## 11. Trazabilidad doc ↔ migración
+
+| Sección de este doc | Archivo SQL |
+|---|---|
+| 3. DDL canónico (extensiones, catálogos, tablas, índices) | `supabase/migrations/<nueva>_initial_schema.sql` |
+| 4. Triggers (`handle_new_user`, `set_initial_estado`, `set_updated_at`) | misma migración |
+| 5.1–5.4 RPCs (`validar_reporte_ruido`, `*_top_n`, `crear_reporte_con_validacion`, `heatmap_agregado`) | misma migración |
+| 6. RLS (enable sin políticas) | misma migración |
+| 8. Seed (catálogo `tipo_estado` + datos de dev) | `supabase/seed.sql` |
+
+---
+
+## 12. Plan de regeneración de migración
+
+**Estado actual:** la migración committed (`20260502225141_initial_schema.sql`) refleja una versión previa del modelo y está desalineada con este doc en cuatro puntos:
+
+| Desalineación | Esta sección |
+|---|---|
+| Falta `CREATE EXTENSION postgis` | §3.1 |
+| `sensor`/`reporte` sin columna `ubicacion geography` generada ni índice GIST | §3.4 / §3.6 |
+| Tiene `validacion_iot` (N:M descartada), falta `reporte.lectura_evidencia_id` | §3.6, §10.1 |
+| Falta `UNIQUE (sensor_id, timestamp_medicion)` en `lectura` | §3.5 |
+| No incluye ninguna de las 3 RPCs | §5 |
+
+**Decisión:** regenerar como migración limpia (squash). Nada está en producción.
+
+### 12.1 Pasos
+
+1. **Eliminar** `supabase/migrations/20260502225141_initial_schema.sql` y `supabase/seed.sql` (los reemplazamos por nuevos).
+2. **Generar** una migración nueva con timestamp actual:
+   ```bash
+   supabase migration new initial_schema
+   ```
+3. **Poblar** el nuevo archivo SQL con, en este orden:
+   - §3.1 Extensiones (`postgis`).
+   - §3.2 Catálogos (`comuna`, `tipo_estado`).
+   - §3.3 `usuario`.
+   - §3.4 `sensor` (con `ubicacion` generada + GIST).
+   - §3.5 `lectura` (con UNIQUE `(sensor_id, timestamp_medicion)`).
+   - §3.6 `reporte` (con `ubicacion` generada + `lectura_evidencia_id` + GIST).
+   - §3.7 `historial_estado`.
+   - §4 Triggers (`handle_new_user`, `set_initial_estado`, `set_updated_at`).
+   - §5.1–5.4 RPCs (incluye `heatmap_agregado`).
+   - §6 RLS enable.
+4. **Reescribir** `supabase/seed.sql` con: catálogo `tipo_estado`, 3 comunas, 3 sensores con `latitud/longitud` válidos (la columna `ubicacion` se genera automáticamente), unas lecturas mock, sin `validacion_iot`.
+5. **Aplicar local:**
+   ```bash
+   supabase db reset           # drop + recreate + apply migration + seed
+   ```
+6. **Verificar:**
+   - `\dx` muestra `postgis`.
+   - `SELECT * FROM validar_reporte_ruido(-33.4372, -70.6483, now());` retorna o vacío o un row, sin error.
+   - `INSERT` duplicado en `lectura` con mismo `(sensor_id, timestamp_medicion)` falla con UNIQUE violation.
+7. **Aplicar remoto** (cuando esté linkeado el proyecto):
+   ```bash
+   supabase db push
+   ```
+
+### 12.2 Roadmap explícitamente excluido del MVP
+
+- `validacion_iot` (N:M) — §10.1.
+- Particionamiento de `lectura` — §10.3.
+- Vista materializada heatmap — §10.4.
+- Políticas RLS para acceso cliente — §10.2.
+
+No agregar nada de eso en la migración inicial.

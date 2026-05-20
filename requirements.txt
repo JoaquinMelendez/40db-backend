@@ -1,2 +1,12 @@
 fastapi
 uvicorn[standard]
+supabase
+paho-mqtt
+pydantic-settings
+pyjwt[crypto]
+python-ulid
+
+# Dev / test
+pytest
+pytest-asyncio
+httpx
