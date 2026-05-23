@@ -68,19 +68,43 @@ CREATE INDEX idx_sensor_comuna    ON sensor(comuna_id);
 CREATE INDEX idx_sensor_ubicacion ON sensor USING GIST (ubicacion);
 
 -- ----------------------------------------------------------------------------
--- 5. Lectura (telemetría IoT)
+-- 5. Lectura (telemetría IoT, particionada — bbdd.md §3.5 / D8)
 -- ----------------------------------------------------------------------------
+-- PARTITION BY RANGE (timestamp_medicion) para escalar a ~30 sensores @ 5-10s.
+-- La PK y la UNIQUE incluyen la partition key porque Postgres lo exige.
 
 CREATE TABLE lectura (
-  id                 bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  id                 bigint GENERATED ALWAYS AS IDENTITY,
   sensor_id          uuid NOT NULL REFERENCES sensor(id) ON DELETE CASCADE,
   nivel_db           numeric(5, 2) NOT NULL,
   timestamp_medicion timestamptz NOT NULL,
   created_at         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, timestamp_medicion),
   -- Idempotencia ante QoS 1 / reintentos del sensor (iot.md §6.3)
   CONSTRAINT uq_lectura_sensor_timestamp UNIQUE (sensor_id, timestamp_medicion)
-);
+) PARTITION BY RANGE (timestamp_medicion);
 
+-- Particiones mensuales para 2026-05..2026-12 + DEFAULT como red de seguridad.
+-- Roadmap: automatizar con pg_partman (bbdd.md §10.3).
+CREATE TABLE lectura_2026_05 PARTITION OF lectura
+  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+CREATE TABLE lectura_2026_06 PARTITION OF lectura
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+CREATE TABLE lectura_2026_07 PARTITION OF lectura
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+CREATE TABLE lectura_2026_08 PARTITION OF lectura
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+CREATE TABLE lectura_2026_09 PARTITION OF lectura
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE lectura_2026_10 PARTITION OF lectura
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE lectura_2026_11 PARTITION OF lectura
+  FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+CREATE TABLE lectura_2026_12 PARTITION OF lectura
+  FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+CREATE TABLE lectura_default PARTITION OF lectura DEFAULT;
+
+-- Índices a nivel parent: Postgres los propaga a cada partición.
 CREATE INDEX idx_lectura_timestamp        ON lectura(timestamp_medicion);
 CREATE INDEX idx_lectura_sensor_timestamp ON lectura(sensor_id, timestamp_medicion);
 
@@ -89,22 +113,33 @@ CREATE INDEX idx_lectura_sensor_timestamp ON lectura(sensor_id, timestamp_medici
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE reporte (
-  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  usuario_id           uuid NOT NULL REFERENCES usuario(id),
-  atendido_por_id      uuid REFERENCES usuario(id),
-  comuna_id            int  NOT NULL REFERENCES comuna(id),
-  titulo               text NOT NULL,
-  descripcion          text NOT NULL,
-  latitud              numeric(10, 8) NOT NULL,
-  longitud             numeric(11, 8) NOT NULL,
-  ubicacion            geography(Point, 4326)
-                       GENERATED ALWAYS AS (
-                         ST_SetSRID(ST_MakePoint(longitud, latitud), 4326)::geography
-                       ) STORED,
-  -- Evidencia IoT 1:1 (prototipo; N:M queda en roadmap bbdd.md §10.1)
-  lectura_evidencia_id bigint REFERENCES lectura(id) ON DELETE SET NULL,
-  created_at           timestamptz NOT NULL DEFAULT now(),
-  updated_at           timestamptz NOT NULL DEFAULT now()
+  id                          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  usuario_id                  uuid NOT NULL REFERENCES usuario(id),
+  atendido_por_id             uuid REFERENCES usuario(id),
+  comuna_id                   int  NOT NULL REFERENCES comuna(id),
+  titulo                      text NOT NULL,
+  descripcion                 text NOT NULL,
+  latitud                     numeric(10, 8) NOT NULL,
+  longitud                    numeric(11, 8) NOT NULL,
+  ubicacion                   geography(Point, 4326)
+                              GENERATED ALWAYS AS (
+                                ST_SetSRID(ST_MakePoint(longitud, latitud), 4326)::geography
+                              ) STORED,
+  -- Evidencia IoT 1:1 (prototipo; N:M queda en roadmap bbdd.md §10.1).
+  -- FK compuesta porque lectura es particionada y su PK incluye timestamp_medicion (D8).
+  -- chk_evidencia_pair garantiza que ambas columnas vayan juntas.
+  lectura_evidencia_id        bigint,
+  lectura_evidencia_timestamp timestamptz,
+  created_at                  timestamptz NOT NULL DEFAULT now(),
+  updated_at                  timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT chk_evidencia_pair CHECK (
+    (lectura_evidencia_id IS NULL     AND lectura_evidencia_timestamp IS NULL) OR
+    (lectura_evidencia_id IS NOT NULL AND lectura_evidencia_timestamp IS NOT NULL)
+  ),
+  CONSTRAINT fk_reporte_lectura_evidencia
+    FOREIGN KEY (lectura_evidencia_id, lectura_evidencia_timestamp)
+    REFERENCES lectura(id, timestamp_medicion)
+    ON DELETE SET NULL
 );
 
 CREATE INDEX idx_reporte_usuario      ON reporte(usuario_id);
@@ -112,6 +147,9 @@ CREATE INDEX idx_reporte_comuna       ON reporte(comuna_id);
 CREATE INDEX idx_reporte_atendido_por ON reporte(atendido_por_id)
   WHERE atendido_por_id IS NOT NULL;
 CREATE INDEX idx_reporte_ubicacion    ON reporte USING GIST (ubicacion);
+-- Acelera el lookup del FK ON DELETE SET NULL.
+CREATE INDEX idx_reporte_evidencia    ON reporte(lectura_evidencia_id, lectura_evidencia_timestamp)
+  WHERE lectura_evidencia_id IS NOT NULL;
 
 -- ----------------------------------------------------------------------------
 -- 7. Historial de estados
@@ -314,23 +352,27 @@ CREATE OR REPLACE FUNCTION public.crear_reporte_con_validacion(
   p_ventana_minutos      int     DEFAULT 10
 )
 RETURNS TABLE (
-  reporte_id           uuid,
-  lectura_evidencia_id bigint
+  reporte_id                  uuid,
+  lectura_evidencia_id        bigint,
+  lectura_evidencia_timestamp timestamptz
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-  v_reporte_id uuid;
-  v_evidencia  bigint;
-  v_now        timestamptz := now();
+  v_reporte_id   uuid;
+  v_evidencia_id bigint;
+  v_evidencia_ts timestamptz;
+  v_now          timestamptz := now();
 BEGIN
   -- 1. Insertar reporte (trigger set_initial_estado agrega "En espera")
   INSERT INTO reporte (usuario_id, comuna_id, titulo, descripcion, latitud, longitud)
   VALUES (p_usuario_id, p_comuna_id, p_titulo, p_descripcion, p_latitud, p_longitud)
   RETURNING id INTO v_reporte_id;
 
-  -- 2. Si el cliente envió un id, verificarlo (anti-forgery + staleness)
+  -- 2. Si el cliente envió un id, verificarlo (anti-forgery + staleness).
+  --    Capturamos también timestamp_medicion porque la FK a lectura es compuesta (D8).
   IF p_lectura_evidencia_id IS NOT NULL THEN
-    SELECT lectura_id INTO v_evidencia
+    SELECT lectura_id, timestamp_medicion
+      INTO v_evidencia_id, v_evidencia_ts
     FROM public.validar_reporte_ruido_top_n(
            p_latitud, p_longitud, v_now,
            5, p_radio_metros, p_umbral_db, p_ventana_minutos
@@ -339,9 +381,10 @@ BEGIN
     LIMIT 1;
   END IF;
 
-  -- 3. Fallback: si no se validó el id del cliente, buscar automáticamente
-  IF v_evidencia IS NULL THEN
-    SELECT lectura_id INTO v_evidencia
+  -- 3. Fallback: si no se validó el id del cliente, buscar automáticamente.
+  IF v_evidencia_id IS NULL THEN
+    SELECT lectura_id, timestamp_medicion
+      INTO v_evidencia_id, v_evidencia_ts
     FROM public.validar_reporte_ruido(
            p_latitud, p_longitud, v_now,
            p_radio_metros, p_umbral_db, p_ventana_minutos
@@ -349,12 +392,15 @@ BEGIN
     LIMIT 1;
   END IF;
 
-  -- 4. Adjuntar evidencia si la hay
-  IF v_evidencia IS NOT NULL THEN
-    UPDATE reporte SET lectura_evidencia_id = v_evidencia WHERE id = v_reporte_id;
+  -- 4. Adjuntar evidencia si la hay (par id+timestamp; chk_evidencia_pair).
+  IF v_evidencia_id IS NOT NULL THEN
+    UPDATE reporte
+       SET lectura_evidencia_id        = v_evidencia_id,
+           lectura_evidencia_timestamp = v_evidencia_ts
+     WHERE id = v_reporte_id;
   END IF;
 
-  RETURN QUERY SELECT v_reporte_id, v_evidencia;
+  RETURN QUERY SELECT v_reporte_id, v_evidencia_id, v_evidencia_ts;
 END;
 $$;
 
