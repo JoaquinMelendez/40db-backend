@@ -38,6 +38,8 @@ Snapshot del `.ino` actual contra lo que este documento exige. Cada fila bloquea
 
 **Mientras el firmware no se actualice**, el backend no recibirá lecturas válidas — la tabla `lectura` se llenará con seed para desarrollo (`bbdd.md` §8) y las RPCs de validación retornarán vacío en producción real.
 
+📋 **Plan ejecutable para cerrar estas divergencias y conectar el flujo E2E**: ver `§10` al final de este documento.
+
 ---
 
 ## 1. Decisiones del contrato
@@ -51,7 +53,7 @@ Snapshot del `.ino` actual contra lo que este documento exige. Cada fila bloquea
 | I5 | **QoS 1 (at-least-once)** | 🔒 | Para sensores ambientales, perder lecturas ocasionales es tolerable, pero QoS 1 con idempotencia (I7) da una garantía razonable sin la complejidad de QoS 2. El firmware actual usa QoS 0 — debe subir a 1. |
 | I6 | **No retain** flag en mensajes | 🔒 | Lecturas son time-series, no estado. Un suscriptor nuevo no debería recibir la "última lectura" como si fuera actual. |
 | I7 | **Idempotencia: `(sensor_id, timestamp_medicion)` es UNIQUE en `lectura`** | 🔒 | QoS 1 puede duplicar. La UNIQUE constraint absorbe duplicados sin error. Sigue siendo válida tras particionamiento (`bbdd.md` §3.5). |
-| I8 | **Autenticación: usuario/password por sensor en HiveMQ** | 🤝 | Cada sensor tiene credenciales propias para que la pérdida de una no comprometa la red. Alternativa más simple: un user compartido (ver §5.2). El firmware actual usa shared — aceptable mientras no haya promoción a producción. |
+| I8 | **Autenticación HiveMQ híbrida MVP: backend dedicado + publisher compartido** | 🔒 (MVP) / 🤝 (escala) | El backend usa `backend-subscriber` con ACL `SUBSCRIBE 40db/#` (solo lee). Los sensores comparten un único user `40db-sensor` con ACL `PUBLISH 40db/sensores/+/lectura` mientras haya 1 sensor en MVP. Cuando entren más sensores, migrar a credenciales por-sensor (§5.1) — sigue 🤝 para esa fase. Cerrado para MVP en §10. |
 | I9 | **TLS obligatorio** (puerto 8883) con verificación de certificado | 🔒 | HiveMQ Cloud lo exige; además, las lecturas pueden derivar PII (ubicación + tiempo). El `setInsecure()` del firmware actual debe reemplazarse por verificación del cert raíz de HiveMQ. |
 | I10 | **`lectura` es tabla particionada por mes** (Postgres native) | 🔒 | Diseño para 30 sensores a 5–10s sin TimescaleDB (no disponible en Supabase). Implicaciones del lado backend: ninguna — el INSERT `ON CONFLICT` ignora la partición. Ver `bbdd.md` §3.5 / D8. |
 
@@ -293,3 +295,273 @@ El firmware está bajo control de este equipo (no de un externo). La lista de ca
 - Si se agregan campos al payload (batería, RSSI, temperatura), confirmar antes para que el parser del backend los acepte.
 
 Cuando un punto se cierra, actualizar la columna "Tipo" en §1 de 🤝 a 🔒 y la tabla de §0 (si aplica).
+
+---
+
+## 10. Plan de implementación IoT (E2E)
+
+Plan ejecutable que cierra todas las 🔴 de §0 y conecta el flujo completo **sensor → HiveMQ → backend → DB**. Asume estado actual (2026-05-23):
+- Backend desplegado en Render free tier, validado en smoke test.
+- Supabase online con el schema definitivo (partición + FK compuesta).
+- Cluster HiveMQ Cloud activo, ya recibiendo mensajes del firmware actual (formato divergente).
+- ESP32 + KY-038 físicamente disponibles, prestados por un compañero.
+- Sin WiFi propio configurado todavía. Sin sensor provisionado en `public.sensor`.
+
+### 10.1 Pre-requisitos
+
+| Recurso | Estado | Acción si falta |
+|---|---|---|
+| Cluster HiveMQ Cloud | ✅ existe | – |
+| Credenciales actuales `40db-sensor` (publisher) | ✅ funcionando | – |
+| Acceso al panel HiveMQ Cloud | 🤔 verificar | Login a console.hivemq.cloud |
+| Supabase online linked | ✅ aplicado en smoke | – |
+| Backend desplegado en Render | ✅ smoke OK | – |
+| Variables MQTT en Render | ❌ falta | §10.5 |
+| Comuna "Maipú" en seed/DB | ❌ falta (seed tiene solo Santiago/Providencia/Las Condes) | §10.2 paso 1 |
+| Sensor en `public.sensor` con UUID conocido | ❌ falta | §10.2 paso 2 |
+| User `backend-subscriber` en HiveMQ | ❌ falta | §10.3 |
+| ESP32 reconfigurado | ❌ está con creds/WiFi del compañero | §10.4 |
+| Cert raíz CA de HiveMQ Cloud | ❌ pendiente descarga | §10.4 paso 4 |
+
+### 10.2 Provisioning del sensor en Supabase
+
+**Paso 1 — Asegurar la comuna en `comuna`.**
+
+El seed actual solo tiene Santiago/Providencia/Las Condes. El sensor del .ino está en Villa El Abrazo, Maipú (-33.5180, -70.7580). Insertar Maipú:
+
+```sql
+INSERT INTO comuna (nombre, region, codigo)
+VALUES ('Maipú', 'Metropolitana', '13119')
+ON CONFLICT (codigo) DO NOTHING;
+```
+
+(Código `13119` es el oficial del INE chileno para Maipú; verificar si el seed cambia política de códigos.)
+
+**Paso 2 — Crear el sensor y guardar el UUID.**
+
+```sql
+INSERT INTO sensor (comuna_id, nombre, latitud, longitud)
+VALUES (
+  (SELECT id FROM comuna WHERE codigo='13119'),
+  'Villa El Abrazo - Maipu',
+  -33.5180,
+  -70.7580
+)
+RETURNING id;
+```
+
+El UUID retornado (formato `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) es lo que va al firmware como `SENSOR_ID`. **Guardalo en un lugar seguro** (1Password, nota local) — lo vas a usar dos veces (firmware + HiveMQ ACL si más adelante se mueve a per-sensor).
+
+**Paso 3 — Verificación.**
+
+```sql
+SELECT id, nombre, latitud, longitud, ST_AsText(ubicacion) AS geo
+FROM sensor WHERE nombre='Villa El Abrazo - Maipu';
+```
+
+Debe mostrar `POINT(-70.758 -33.518)` (longitud primero, latitud segundo — convención PostGIS).
+
+### 10.3 HiveMQ: crear `backend-subscriber`
+
+En el panel de HiveMQ Cloud → Access Management → Credentials:
+
+1. **Crear nuevo credential:**
+   - Username: `backend-subscriber`
+   - Password: generar uno fuerte (32+ chars), guardar en password manager
+2. **ACL para ese credential:**
+   - Topic filter: `40db/#`
+   - Permission: **Subscribe** únicamente (no Publish)
+3. **Verificar que el credential del publisher (`40db-sensor`) sigue activo** y solo tiene permiso de **Publish** sobre `40db/sensores/+/lectura`. Si tenía ACL abierta (`#` con publish+subscribe), restringirla ahora — principio de mínimo privilegio.
+
+Anotar: `MQTT_BROKER_URL`, `MQTT_USER=backend-subscriber`, `MQTT_PASSWORD=<generado>`.
+
+### 10.4 Cambios al firmware ESP32
+
+Diff contra `sensor_ruido_40db.ino` actual. Mantener la estructura de archivos pero modificar las siguientes secciones:
+
+**1. Identidad del sensor (líneas 7-9):**
+
+```c
+// ANTES
+const char* SENSOR_ID = "UE-MAI-0001";
+const float LAT = -33.5180;
+const float LNG = -70.7580;
+
+// DESPUÉS — UUID provisionado en §10.2 paso 2. LAT/LNG ya no se publican
+// (el backend los lee de public.sensor); solo se mantienen como referencia humana.
+const char* SENSOR_ID = "PEGAR_UUID_DE_10.2_PASO_2";
+```
+
+**2. WiFi (líneas 12-13):**
+
+```c
+// ANTES (red del compañero)
+const char* WIFI_SSID = "Saavedra";
+const char* WIFI_PASS = "Matias200300400";
+
+// DESPUÉS — tu red
+const char* WIFI_SSID = "TU_SSID";
+const char* WIFI_PASS = "TU_PASSWORD";
+```
+
+**3. MQTT (líneas 15-20):**
+
+```c
+// ANTES
+const char* MQTT_TOPIC = "40db/sensors/UE-MAI-0001/readings";
+
+// DESPUÉS — usa el UUID. Topic format del contrato (§2.1)
+// Construir el topic con String para evitar errores de typo:
+String mqttTopic = String("40db/sensores/") + SENSOR_ID + "/lectura";
+// O hardcoded con el UUID concatenado a mano:
+const char* MQTT_TOPIC = "40db/sensores/<UUID>/lectura";
+```
+
+Las credenciales `40db-sensor` / `2qcMJmByQm3yUQz3` actuales **se mantienen** porque cubren el rol publisher (§10.3 confirma que ese credential sigue activo).
+
+**4. NTP + TLS — agregar al `setup()` antes del `connectMqtt()`:**
+
+```c
+#include <time.h>
+
+void syncTime() {
+  Serial.print("Sincronizando NTP");
+  configTime(0, 0, "pool.ntp.org", "time.google.com");  // UTC
+  time_t now = 0;
+  while (now < 1700000000) {  // ~nov 2023, suficiente como "ya sincronizó"
+    delay(500);
+    Serial.print(".");
+    time(&now);
+  }
+  Serial.printf("\nNTP OK. Epoch=%ld\n", now);
+}
+
+// En setup(), entre connectWifi() y connectMqtt():
+syncTime();
+```
+
+**5. TLS con verificación de cert (reemplazar `setInsecure()`):**
+
+```c
+// ANTES (línea 102)
+wifiClient.setInsecure();
+
+// DESPUÉS — usar el cert raíz que HiveMQ Cloud publica (ISRG Root X1 de Let's Encrypt).
+// Descargar de https://letsencrypt.org/certs/isrgrootx1.pem y embeber:
+const char* HIVEMQ_CA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+... (pegar el contenido completo del .pem)
+-----END CERTIFICATE-----
+)EOF";
+
+wifiClient.setCACert(HIVEMQ_CA_CERT);
+```
+
+**6. Publicación con QoS 1 (reemplazar `publishReading`):**
+
+`PubSubClient` (la librería actual) **no soporta QoS 1 en publish** — `mqtt.publish()` siempre es QoS 0. Opciones:
+
+- **Opción A (mínimo cambio):** dejar QoS 0 en MVP. La idempotencia por `(sensor_id, timestamp_medicion)` UNIQUE en `lectura` cubre duplicados; lo que perdemos con QoS 0 son lecturas que el cliente cree haber publicado pero el broker no recibió. Aceptable para 1 sensor de testing.
+- **Opción B (correcto):** migrar a `AsyncMqttClient` o `PicoMQTT` que sí soportan QoS 1. Más trabajo, mejor garantía. Recomendado para producción real, no obligatorio para MVP.
+
+**Decisión MVP: Opción A**. Se documenta como deuda técnica. Si en algún momento se ven huecos sospechosos en `lectura`, migrar a Opción B.
+
+**Reescritura del `publishReading()`:**
+
+```c
+void publishReading(float db) {
+  // Timestamp ISO 8601 UTC
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  char ts[32];
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+  // Payload del contrato (§3.1): solo nivel_db + timestamp_medicion
+  StaticJsonDocument<128> doc;
+  doc["nivel_db"]           = db;
+  doc["timestamp_medicion"] = ts;
+
+  char buf[128];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish(MQTT_TOPIC, buf, false);  // retain=false (§1 I6)
+
+  Serial.print("PUB → ");
+  Serial.println(buf);
+}
+```
+
+**7. Frecuencia.** Para 1 sensor de testing, **dejar `delay(5000)`** como está. Cuando se sume un segundo sensor, subir a 10s base (§4).
+
+### 10.5 Backend: env vars en Render
+
+En el panel de Render → Service → Environment → Add Environment Variable:
+
+```
+MQTT_BROKER_URL=ssl://<TU_CLUSTER>.s1.eu.hivemq.cloud:8883
+MQTT_USER=backend-subscriber
+MQTT_PASSWORD=<el que generaste en §10.3>
+MQTT_CLIENT_ID=40db-backend-prod
+```
+
+`MQTT_BROKER_URL` toma el formato `ssl://<host>:<port>` que ya espera el `MqttIngestor` (ver `app/infrastructure/mqtt/ingestor.py:35`).
+
+Guardar disparará un redeploy. Cuando termine, verificar:
+
+```bash
+curl https://four0db-backend.onrender.com/health/ready
+# Esperado: {"checks": {... "mqtt": "ok"}} (ya no "disabled")
+```
+
+Si `mqtt` viene como `"reconnecting"` o `"error"`, revisar logs en Render — el host del broker o las creds están mal.
+
+### 10.6 Workflow de testing manual
+
+Por el patrón "ESP32 apagado, encendido solo para probar" + Render free dormido:
+
+1. **Despertar el backend** (1ª request HTTP demora ~30-50s en free tier):
+   ```bash
+   curl https://four0db-backend.onrender.com/health/live
+   ```
+2. **Esperar ~30 s** y confirmar que el ingestor MQTT conectó:
+   ```bash
+   curl https://four0db-backend.onrender.com/health/ready
+   # esperar a ver "mqtt": "ok"
+   ```
+3. **Encender el ESP32.** Mirar el Serial Monitor: `WiFi OK → NTP OK → MQTT OK → PUB →`.
+4. **En Render logs** (panel del servicio → Logs) debería aparecer línea con el INSERT en `lectura`.
+5. **Verificar en Supabase**:
+   ```sql
+   SELECT tableoid::regclass, nivel_db, timestamp_medicion
+   FROM lectura
+   WHERE sensor_id='<UUID del sensor>'
+   ORDER BY timestamp_medicion DESC LIMIT 5;
+   ```
+   La fila más nueva debe caer en `lectura_2026_05` (o el mes que corresponda) — confirma que la partición funciona en producción real.
+6. **Apagar el ESP32** cuando termines de probar.
+
+### 10.7 Consideraciones operativas
+
+**Render free tier — dormido.** El servicio HTTP duerme tras 15 min sin requests. Cuando duerme, el proceso muere, y con él el subscriber MQTT. Implicaciones para este MVP:
+
+- ✅ **No afecta el testing intencional** porque siempre despertás manualmente con curl antes de encender el sensor (§10.6 paso 1).
+- ⚠️ **Afecta si el sensor publica mientras Render duerme** — esas lecturas se pierden, HiveMQ las descarta tras N segundos sin suscriptores (TTL de la sesión). Mientras el ESP32 esté apagado entre pruebas, no es problema.
+- 🛡️ **Para el día de la presentación**: upgradar a Render paid el día anterior, hacer una corrida de prueba, dejar todo on. Costo: ~7 USD/mes prorrateado a un día = ~$0.25/día (Render permite downgrade después).
+
+**HiveMQ Cloud free tier — límites.** 100 conexiones concurrentes, 10 GB/mes de tráfico. Con 1 sensor a 5s + backend, estás muy por debajo del límite — no hay que preocuparse hasta que se sumen >50 sensores activos.
+
+**Buffer en el ESP32.** El `.ino` actual no buffer-ea cuando MQTT/WiFi cae. Para MVP es aceptable; si se necesita resiliencia, agregar buffer circular en RAM (~1000 lecturas) o en SPIFFS. Queda como roadmap.
+
+### 10.8 Checklist de cierre
+
+Cuando se completen todos los pasos, actualizar §0 y §1:
+
+- [ ] §10.2 ejecutado, UUID del sensor guardado.
+- [ ] §10.3 ejecutado, `backend-subscriber` activo en HiveMQ.
+- [ ] §10.4 aplicado en firmware (cambios 1-6).
+- [ ] §10.5 vars en Render, `/health/ready` reporta `mqtt: ok`.
+- [ ] §10.6 workflow ejecutado: una lectura llegó del ESP32 al backend al `lectura_2026_XX`.
+- [ ] §0 tabla de divergencias: las 🔴 pasan a ✅ (puede comentarse "cerrado en §10.X").
+- [ ] §1 I5 (QoS 1) sigue como 🔒 nominal pero anotar que el firmware MVP corre Opción A (QoS 0). Si se migra a Opción B, esto se resuelve definitivamente.
