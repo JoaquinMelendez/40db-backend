@@ -15,8 +15,9 @@ Este documento define el **modelo de datos canónico** del backend 40dB: DDL, í
 | D3 | **Estado del reporte como historial append-only** (`historial_estado`) | Auditoría completa: quién cambió a qué, cuándo y por qué. Estado actual = último row por `reporte_id` (índice compuesto lo hace barato). |
 | D4 | **RLS habilitada sin políticas** | Todo el tráfico pasa por FastAPI con `service_role_key`. El frontend **nunca** habla con Supabase directo. Bypass por diseño, no por descuido. |
 | D5 | **lat/lng numéricos se mantienen** como columnas fuente; `ubicacion` es `GENERATED STORED` | Source of truth humano-legible. La columna PostGIS se deriva, no se duplica manualmente. |
-| D6 | **FK a `lectura` (no a `sensor`) para evidencia** | `lectura_evidencia_id bigint REFERENCES lectura(id) ON DELETE SET NULL`. Navegamos sensor + dB + timestamp por JOIN sin desnormalizar. |
+| D6 | **FK compuesta a `lectura` (no a `sensor`) para evidencia** | `reporte` referencia `(lectura_evidencia_id, lectura_evidencia_timestamp)` contra `(lectura.id, lectura.timestamp_medicion)`. La denormalización del timestamp es **obligatoria** porque `lectura` es particionada (D8) — Postgres exige que toda UNIQUE/PK incluya la partition key, y una FK solo puede apuntar a esa UNIQUE/PK. Navegamos sensor + dB por JOIN sin desnormalizar más. |
 | D7 | **Catálogos pequeños como tablas, no enums** | `comuna`, `tipo_estado`. Permite agregar valores sin migración y referenciarlos por FK. |
+| D8 | **`lectura` particionada por mes desde el inicio (`PARTITION BY RANGE (timestamp_medicion)`)** | Diseñada para escalar a ~30 sensores publicando cada 5–10s. Supabase **no soporta TimescaleDB**, así que se usa partición nativa de Postgres. Particionar desde el día 1 evita una migración dolorosa después (cambiar a partitioned table requiere recrear toda la tabla y FKs). La cadencia mensual cubre ~8–16M rows/partición con el volumen objetivo, manejable por btree/GIST sin presión. |
 
 ---
 
@@ -120,23 +121,54 @@ CREATE INDEX idx_sensor_comuna    ON sensor(comuna_id);
 CREATE INDEX idx_sensor_ubicacion ON sensor USING GIST (ubicacion);
 ```
 
-### 3.5 Lectura (telemetría IoT)
+### 3.5 Lectura (telemetría IoT, particionada)
+
+Tabla diseñada para alto volumen (ver D8). `PARTITION BY RANGE (timestamp_medicion)` con particiones mensuales. La PK y la UNIQUE incluyen `timestamp_medicion` porque Postgres exige que toda constraint de unicidad contenga la partition key.
 
 ```sql
 CREATE TABLE lectura (
-  id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  id                  bigint GENERATED ALWAYS AS IDENTITY,
   sensor_id           uuid NOT NULL REFERENCES sensor(id) ON DELETE CASCADE,
   nivel_db            numeric(5, 2) NOT NULL,
   timestamp_medicion  timestamptz NOT NULL,
   created_at          timestamptz NOT NULL DEFAULT now(),
-  -- Idempotencia ante QoS 1 / reintentos del sensor (ver iot.md §6.3)
+  -- PK compuesta: la partition key (timestamp_medicion) debe estar incluida
+  PRIMARY KEY (id, timestamp_medicion),
+  -- Idempotencia ante QoS 1 / reintentos del sensor (ver iot.md §6.3).
+  -- Ya incluye la partition key, así que es válida globalmente.
   CONSTRAINT uq_lectura_sensor_timestamp UNIQUE (sensor_id, timestamp_medicion)
-);
+) PARTITION BY RANGE (timestamp_medicion);
 
--- Heatmap (filtro temporal puro) + matching IoT (sensor+ventana)
+-- Índices declarados a nivel parent: Postgres los propaga a cada partición.
 CREATE INDEX idx_lectura_timestamp        ON lectura(timestamp_medicion);
 CREATE INDEX idx_lectura_sensor_timestamp ON lectura(sensor_id, timestamp_medicion);
 ```
+
+#### 3.5.1 Particiones iniciales
+
+La migración crea **8 particiones mensuales** (mayo–diciembre 2026) más una **partición default** como red de seguridad para timestamps fuera de rango. Esto cubre el horizonte del MVP sin necesitar automatización aún.
+
+```sql
+CREATE TABLE lectura_2026_05 PARTITION OF lectura
+  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+CREATE TABLE lectura_2026_06 PARTITION OF lectura
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+-- … (07, 08, 09, 10, 11, 12)
+CREATE TABLE lectura_2026_12 PARTITION OF lectura
+  FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+CREATE TABLE lectura_default PARTITION OF lectura DEFAULT;
+```
+
+**Sobre la partición `DEFAULT`.** Atrapa cualquier `INSERT` con timestamp fuera de los rangos declarados (ej. skew de reloj severo, lecturas antiguas reenviadas, o un mes sin crear). Es una **red de seguridad explícita**, no un mecanismo de producción: cuando se acerca el fin del año, hay que crear las particiones del año siguiente **antes** de que la default empiece a recibir tráfico, porque el planner penaliza con DEFAULT pobladas (no puede prunear).
+
+#### 3.5.2 Mantenimiento de particiones
+
+**MVP (manual + cron simple):**
+- Pre-crear 3 meses de futuro al inicio.
+- Una tarea trimestral (revisión humana, o `pg_cron` con script SQL) crea las siguientes 3 particiones.
+- Drop manual de particiones antiguas si se decide retención (no antes de tener política de retención definida — por ahora retenemos todo).
+
+**Roadmap:** `pg_partman` para automatizar creación + drop con política declarativa. Supabase soporta `pg_partman` desde plan Pro. Ver §10.3 para detalle del trigger de migración.
 
 ### 3.6 Reporte
 
@@ -154,10 +186,21 @@ CREATE TABLE reporte (
                         GENERATED ALWAYS AS (
                           ST_SetSRID(ST_MakePoint(longitud, latitud), 4326)::geography
                         ) STORED,
-  -- Evidencia IoT (prototipo 1:1, ver roadmap para N:M)
-  lectura_evidencia_id  bigint REFERENCES lectura(id) ON DELETE SET NULL,
+  -- Evidencia IoT (prototipo 1:1, ver roadmap para N:M).
+  -- FK compuesta porque `lectura` es particionada: la PK incluye timestamp_medicion (D8).
+  -- Ambas columnas se setean juntas o ambas son NULL (chk_evidencia_pair).
+  lectura_evidencia_id          bigint,
+  lectura_evidencia_timestamp   timestamptz,
   created_at            timestamptz NOT NULL DEFAULT now(),
-  updated_at            timestamptz NOT NULL DEFAULT now()
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT chk_evidencia_pair CHECK (
+    (lectura_evidencia_id IS NULL     AND lectura_evidencia_timestamp IS NULL) OR
+    (lectura_evidencia_id IS NOT NULL AND lectura_evidencia_timestamp IS NOT NULL)
+  ),
+  CONSTRAINT fk_reporte_lectura_evidencia
+    FOREIGN KEY (lectura_evidencia_id, lectura_evidencia_timestamp)
+    REFERENCES lectura(id, timestamp_medicion)
+    ON DELETE SET NULL
 );
 
 CREATE INDEX idx_reporte_usuario      ON reporte(usuario_id);
@@ -165,6 +208,9 @@ CREATE INDEX idx_reporte_comuna       ON reporte(comuna_id);
 CREATE INDEX idx_reporte_atendido_por ON reporte(atendido_por_id)
   WHERE atendido_por_id IS NOT NULL;
 CREATE INDEX idx_reporte_ubicacion    ON reporte USING GIST (ubicacion);
+-- Para acelerar el lookup de FK (ON DELETE SET NULL escanea esta combinación)
+CREATE INDEX idx_reporte_evidencia    ON reporte(lectura_evidencia_id, lectura_evidencia_timestamp)
+  WHERE lectura_evidencia_id IS NOT NULL;
 ```
 
 ### 3.7 Historial de estados
@@ -345,41 +391,49 @@ CREATE OR REPLACE FUNCTION public.crear_reporte_con_validacion(
   p_lectura_evidencia_id  bigint DEFAULT NULL
 )
 RETURNS TABLE (
-  reporte_id            uuid,
-  lectura_evidencia_id  bigint
+  reporte_id                  uuid,
+  lectura_evidencia_id        bigint,
+  lectura_evidencia_timestamp timestamptz
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-  v_reporte_id  uuid;
-  v_evidencia   bigint;
-  v_now         timestamptz := now();
+  v_reporte_id   uuid;
+  v_evidencia_id bigint;
+  v_evidencia_ts timestamptz;
+  v_now          timestamptz := now();
 BEGIN
   -- 1. Insertar el reporte (trigger set_initial_estado agrega "En espera")
   INSERT INTO reporte (usuario_id, comuna_id, titulo, descripcion, latitud, longitud)
   VALUES (p_usuario_id, p_comuna_id, p_titulo, p_descripcion, p_latitud, p_longitud)
   RETURNING id INTO v_reporte_id;
 
-  -- 2. Si el cliente envió un id, verificarlo (anti-forgery + staleness)
+  -- 2. Si el cliente envió un id, verificarlo (anti-forgery + staleness).
+  --    Capturamos también el timestamp_medicion porque la FK a lectura es compuesta (D8).
   IF p_lectura_evidencia_id IS NOT NULL THEN
-    SELECT lectura_id INTO v_evidencia
+    SELECT lectura_id, timestamp_medicion
+      INTO v_evidencia_id, v_evidencia_ts
     FROM validar_reporte_ruido_top_n(p_latitud, p_longitud, v_now, 5)
     WHERE lectura_id = p_lectura_evidencia_id
     LIMIT 1;
   END IF;
 
-  -- 3. Si no se adjuntó nada en el paso 2, intentar fallback automático
-  IF v_evidencia IS NULL THEN
-    SELECT lectura_id INTO v_evidencia
+  -- 3. Si no se adjuntó nada en el paso 2, intentar fallback automático.
+  IF v_evidencia_id IS NULL THEN
+    SELECT lectura_id, timestamp_medicion
+      INTO v_evidencia_id, v_evidencia_ts
     FROM validar_reporte_ruido(p_latitud, p_longitud, v_now)
     LIMIT 1;
   END IF;
 
-  -- 4. Adjuntar la evidencia (si la hay)
-  IF v_evidencia IS NOT NULL THEN
-    UPDATE reporte SET lectura_evidencia_id = v_evidencia WHERE id = v_reporte_id;
+  -- 4. Adjuntar la evidencia (si la hay). Las dos columnas van juntas (chk_evidencia_pair).
+  IF v_evidencia_id IS NOT NULL THEN
+    UPDATE reporte
+       SET lectura_evidencia_id        = v_evidencia_id,
+           lectura_evidencia_timestamp = v_evidencia_ts
+     WHERE id = v_reporte_id;
   END IF;
 
-  RETURN QUERY SELECT v_reporte_id, v_evidencia;
+  RETURN QUERY SELECT v_reporte_id, v_evidencia_id, v_evidencia_ts;
 END; $$;
 ```
 
@@ -569,8 +623,13 @@ Si en algún momento el frontend lee Supabase directo (ej. real-time subscriptio
 - `reporte` → SELECT propio (`auth.uid() = usuario_id`) o municipal de la misma comuna.
 - `lectura` → SELECT público (data acústica anónima, agregada).
 
-### 10.3 Particionamiento de `lectura`
-Cuando `lectura` supere ~10M de rows, particionar por mes (`PARTITION BY RANGE (timestamp_medicion)`). El índice `idx_lectura_sensor_timestamp` ya está alineado con el patrón de query, así que solo hay que aplicar el `PARTITION BY` al crear la tabla.
+### 10.3 Automatización de creación/drop de particiones
+
+El particionamiento de `lectura` **ya no es roadmap** — está incorporado al MVP (D8, §3.5). Lo que queda como evolución es **automatizar la creación** de particiones futuras y **definir política de retención**:
+
+- **Trigger de adopción de `pg_partman`:** cuando el equipo decida automatizar (típicamente al notar que pre-crear manualmente cada trimestre se vuelve tedioso, o al acercarse a una partición default poblada). Supabase soporta `pg_partman` desde plan Pro. Una vez habilitado, se registra `lectura` como tabla gestionada con cadencia mensual y un buffer de N meses futuros.
+- **Política de retención:** por ahora **retenemos todo** (utilidad histórica para heatmap y posibles re-validaciones). Si el volumen lo exige, definir corte (ej. "drop > 24 meses") y configurarlo en `pg_partman` o como cron manual.
+- **Compresión:** Postgres nativo no comprime particiones (a diferencia de TimescaleDB). Si la huella en disco se vuelve un problema, evaluar `pg_squeeze` o migrar al stack alternativo descrito en `backend.md` §9.
 
 ### 10.4 Vista materializada para heatmap
 Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios por celda H3/geohash + bucket de 5 minutos. Refresh incremental on-demand o vía pg_cron.
@@ -591,15 +650,18 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
 
 ## 12. Plan de regeneración de migración
 
-**Estado actual:** la migración committed (`20260502225141_initial_schema.sql`) refleja una versión previa del modelo y está desalineada con este doc en cuatro puntos:
+**Estado actual:** la migración committed (`20260519000000_initial_schema.sql`, anteriormente `20260502225141_…`) refleja una versión previa del modelo y está desalineada con este doc en varios puntos:
 
 | Desalineación | Esta sección |
 |---|---|
 | Falta `CREATE EXTENSION postgis` | §3.1 |
 | `sensor`/`reporte` sin columna `ubicacion geography` generada ni índice GIST | §3.4 / §3.6 |
-| Tiene `validacion_iot` (N:M descartada), falta `reporte.lectura_evidencia_id` | §3.6, §10.1 |
+| Tiene `validacion_iot` (N:M descartada), falta `reporte.lectura_evidencia_id` + `…_timestamp` | §3.6, §10.1 |
+| `lectura` no es particionada por rango sobre `timestamp_medicion` | §3.5 (D8) |
 | Falta `UNIQUE (sensor_id, timestamp_medicion)` en `lectura` | §3.5 |
-| No incluye ninguna de las 3 RPCs | §5 |
+| Falta PK compuesta `(id, timestamp_medicion)` en `lectura` (exigida por la partición) | §3.5 |
+| `reporte` no tiene FK compuesta a `(lectura.id, lectura.timestamp_medicion)` | §3.6, D6 |
+| No incluye ninguna de las 4 RPCs | §5 |
 
 **Decisión:** regenerar como migración limpia (squash). Nada está en producción.
 
@@ -615,11 +677,12 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
    - §3.2 Catálogos (`comuna`, `tipo_estado`).
    - §3.3 `usuario`.
    - §3.4 `sensor` (con `ubicacion` generada + GIST).
-   - §3.5 `lectura` (con UNIQUE `(sensor_id, timestamp_medicion)`).
-   - §3.6 `reporte` (con `ubicacion` generada + `lectura_evidencia_id` + GIST).
+   - §3.5 `lectura` **particionada** (`PARTITION BY RANGE (timestamp_medicion)`) + PK compuesta + UNIQUE `(sensor_id, timestamp_medicion)`.
+   - §3.5.1 Crear particiones mensuales para 2026-05 … 2026-12 + `lectura_default`.
+   - §3.6 `reporte` (con `ubicacion` generada + `lectura_evidencia_id` + `lectura_evidencia_timestamp` + FK compuesta + `chk_evidencia_pair` + GIST).
    - §3.7 `historial_estado`.
    - §4 Triggers (`handle_new_user`, `set_initial_estado`, `set_updated_at`).
-   - §5.1–5.4 RPCs (incluye `heatmap_agregado`).
+   - §5.1–5.4 RPCs (incluye `heatmap_agregado`; `crear_reporte_con_validacion` devuelve el par id+timestamp).
    - §6 RLS enable.
 4. **Reescribir** `supabase/seed.sql` con: catálogo `tipo_estado`, 3 comunas, 3 sensores con `latitud/longitud` válidos (la columna `ubicacion` se genera automáticamente), unas lecturas mock, sin `validacion_iot`.
 5. **Aplicar local:**
@@ -628,8 +691,11 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
    ```
 6. **Verificar:**
    - `\dx` muestra `postgis`.
+   - `\d+ lectura` muestra `Partition key: RANGE (timestamp_medicion)` y lista las particiones mensuales + `lectura_default`.
    - `SELECT * FROM validar_reporte_ruido(-33.4372, -70.6483, now());` retorna o vacío o un row, sin error.
    - `INSERT` duplicado en `lectura` con mismo `(sensor_id, timestamp_medicion)` falla con UNIQUE violation.
+   - Un `INSERT INTO lectura` con `timestamp_medicion` dentro de mayo 2026 cae en `lectura_2026_05` (`SELECT tableoid::regclass, * FROM lectura LIMIT 1;` confirma).
+   - `INSERT INTO reporte (..., lectura_evidencia_id, lectura_evidencia_timestamp)` con par válido funciona; con par solo-id-o-solo-timestamp falla por `chk_evidencia_pair`; con id+timestamp inexistentes falla por la FK compuesta.
 7. **Aplicar remoto** (cuando esté linkeado el proyecto):
    ```bash
    supabase db push
@@ -638,7 +704,7 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
 ### 12.2 Roadmap explícitamente excluido del MVP
 
 - `validacion_iot` (N:M) — §10.1.
-- Particionamiento de `lectura` — §10.3.
+- **Automatización** con `pg_partman` y política de retención — §10.3 (las particiones iniciales sí están en el MVP, ver §3.5.1).
 - Vista materializada heatmap — §10.4.
 - Políticas RLS para acceso cliente — §10.2.
 

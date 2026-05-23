@@ -424,3 +424,22 @@ ALTER TABLE reporte          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE historial_estado ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sensor            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lectura           ENABLE ROW LEVEL SECURITY;
+
+-- ----------------------------------------------------------------------------
+-- 11. Grants para service_role (bypass RLS por diseño — ver bbdd.md §6)
+-- ----------------------------------------------------------------------------
+-- En Supabase Cloud, los DEFAULT PRIVILEGES sobre el schema public suelen
+-- otorgar acceso automáticamente a service_role, pero no siempre — depende
+-- del rol que aplique la migración. Lo hacemos explícito para que un
+-- `supabase db reset` o un push limpio deje el backend operativo sin pasos
+-- manuales.
+
+GRANT USAGE ON SCHEMA public TO service_role;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO service_role;
+GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT EXECUTE                        ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES    TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT                   ON SEQUENCES TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE                         ON FUNCTIONS TO service_role;
