@@ -41,9 +41,14 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
     return data["created_at"], data["id"]
 
 
+# PostgREST resuelve embeds por nombre de FK constraint cuando el FK es compuesto
+# (lectura_evidencia_id, lectura_evidencia_timestamp) — D8 / ADR 08. La sintaxis
+# `target!constraint_name(...)` es obligatoria; usar el nombre de columna como hint
+# (la forma original `lectura:lectura_evidencia_id(...)`) deja de funcionar porque
+# esa columna ya no es FK por sí sola.
 SELECT_REPORTE = (
     "*, "
-    "lectura:lectura_evidencia_id(id, sensor_id, nivel_db, timestamp_medicion, "
+    "lectura:lectura!fk_reporte_lectura_evidencia(id, sensor_id, nivel_db, timestamp_medicion, "
     "sensor:sensor_id(nombre))"
 )
 

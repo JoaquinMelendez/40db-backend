@@ -53,7 +53,14 @@ def crear_reporte_con_validacion(
     umbral_db: float,
     ventana_minutos: int,
 ) -> tuple[str, Optional[int]]:
-    """Llama a la RPC compuesta atómica. Devuelve (reporte_id, lectura_evidencia_id)."""
+    """Llama a la RPC compuesta atómica. Devuelve (reporte_id, lectura_evidencia_id).
+
+    La RPC SQL devuelve además `lectura_evidencia_timestamp` porque la FK a `lectura`
+    es compuesta (D8 / ADR 08). Ese timestamp solo lo necesita SQL para satisfacer la
+    FK y se persiste internamente por el UPDATE dentro de la RPC. El dominio Python
+    no lo expone — el caller hidrata el objeto EvidenciaIot vía repo, que ya trae
+    timestamp_medicion desde el JOIN a `lectura`.
+    """
     db = get_supabase()
     result = db.rpc("crear_reporte_con_validacion", {
         "p_usuario_id": usuario_id,
