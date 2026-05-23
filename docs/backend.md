@@ -21,7 +21,8 @@ El backend de 40dB resuelve un sistema **híbrido transaccional + telemetría en
 1. **Asimetría de tráfico.** El flujo HTTP (reportes desde Vue 3) es esporádico; el flujo MQTT (sensores) es constante y de alta frecuencia. Una sola app FastAPI debe manejar ambos sin que el IoT bloquee al HTTP.
 2. **Cruce geo-temporal.** Cuando un ciudadano envía un reporte, hay que cruzarlo con sensores cercanos (radio en metros) en una ventana temporal corta (minutos). Eso vive en Postgres con PostGIS, no en Python.
 3. **Agregación para heatmap.** El volumen de `lectura` crece rápido; el frontend no puede recibir millones de puntos. Backend agrega/promedia por área y bucket temporal antes de enviar.
-4. **Múltiples actores de entrada/salida.** HTTP (cliente web), MQTT (sensores), Postgres (persistencia + RPC). El acoplamiento entre ellos debe ser explícito y testeable.
+4. **Volumen de time-series.** Con 30 sensores publicando cada 5–10s, `lectura` crece ~95–190M rows/año (ver `iot.md` §4). Se diseña para escalar desde el día 1: particionamiento nativo por mes (ADR 08), índices alineados con el patrón de query (sensor + tiempo) y agregación en SQL, no en Python.
+5. **Múltiples actores de entrada/salida.** HTTP (cliente web), MQTT (sensores), Postgres (persistencia + RPC). El acoplamiento entre ellos debe ser explícito y testeable.
 
 ---
 
@@ -36,6 +37,7 @@ El backend de 40dB resuelve un sistema **híbrido transaccional + telemetría en
 **Decisión.** Supabase administrado como base de datos y proveedor de autenticación.
 **Por qué.** Minimiza boilerplate (auth, migraciones, panel admin gratis). Postgres permite habilitar **PostGIS** para queries geo. La integración auth ↔ tabla de perfiles se resuelve con un trigger en `auth.users`.
 **Consecuencia.** El backend habla con Supabase via cliente oficial Python. La `service_role_key` es secreta y vive solo en backend (ver ADR 07).
+**Limitaciones aceptadas.** Supabase **no soporta la extensión `timescaledb`**. Para alto volumen de time-series se usa partición nativa de Postgres (ver ADR 08), no hipertablas. Si en el futuro el feedback es no-negociable, ver "Roadmap arquitectónico" §9 para el plan de salida.
 **Detalle de modelo:** [`bbdd.md`](./bbdd.md). Detalle de auth: [`auth.md`](./auth.md).
 
 ### ADR 03 — Ingesta IoT: MQTT vía HiveMQ Cloud
@@ -67,6 +69,22 @@ El backend de 40dB resuelve un sistema **híbrido transaccional + telemetría en
 **Consecuencia.**
 - La `service_role_key` **nunca** se expone al cliente.
 - Si en el futuro algún flujo necesita cliente → Supabase directo (ej. real-time subscriptions), se diseñan políticas en ese momento. Ver [`bbdd.md` §6](./bbdd.md) y [`bbdd.md` §10.2](./bbdd.md).
+
+### ADR 08 — `lectura` particionada por mes desde el inicio (Postgres native partitioning)
+**Decisión.** La tabla `lectura` se crea con `PARTITION BY RANGE (timestamp_medicion)` y particiones mensuales desde la primera migración. **No** se usa TimescaleDB (no disponible en Supabase, ver ADR 02).
+**Por qué.**
+- Volumen objetivo: 30 sensores publicando cada 5–10s = **95–190M lecturas/año** (ver `iot.md` §4). Una tabla monolítica de ese tamaño sufre en `VACUUM`/`ANALYZE` y query planner.
+- Migrar de tabla monolítica a particionada **después** es doloroso: requiere recrear la tabla y todas las FKs que apuntan a ella (en este modelo, `reporte.lectura_evidencia_id`). Hacerlo desde el día 1 evita esa migración.
+- Partición nativa de Postgres es estable desde PG 11, soportada por Supabase, y se integra con índices declarados a nivel parent.
+**Consecuencias arquitectónicas (que SÍ se propagan al diseño):**
+1. **PK de `lectura` es compuesta `(id, timestamp_medicion)`** — Postgres exige que toda PK/UNIQUE de una tabla particionada incluya la partition key.
+2. **`reporte.lectura_evidencia_id` se acompaña de `lectura_evidencia_timestamp`** para poder tener FK compuesta `(id, timestamp_medicion)`. Detalle en [`bbdd.md` §3.6](./bbdd.md).
+3. Las RPCs `validar_reporte_ruido_top_n` y `crear_reporte_con_validacion` devuelven el par `(lectura_id, timestamp_medicion)`, no solo el id.
+4. **Mantenimiento manual al inicio:** se pre-crean 8 meses de particiones (mayo–diciembre 2026) + una partición `DEFAULT` como red de seguridad. Automatización con `pg_partman` queda como roadmap (no MVP).
+**Consecuencias en el resto del sistema (que NO se propagan, gracias a hexagonal lite — ADR 06):**
+- El use case `registrar_lectura` y el puerto `LecturaRepository` **no cambian**. El INSERT `ON CONFLICT (sensor_id, timestamp_medicion) DO NOTHING` funciona idéntico contra tabla particionada — Postgres rutea al partition correcto solo.
+- El `MqttIngestor` no se entera.
+- Las queries del heatmap (RPC `heatmap_agregado`) hacen partition pruning automático con el filtro `WHERE timestamp_medicion BETWEEN …`.
 
 ---
 
@@ -320,4 +338,5 @@ Cambios postergados pero documentados:
 - **SSE para heatmap "vivo"** si surge requerimiento UX.
 - **Matching reactivo de reportes en espera** al llegar lecturas altas (no implementado; el flujo actual es pull, ver §5.1 / §5.2).
 - **Vista materializada** para heatmap si performance lo exige. Ver [`bbdd.md` §10.4](./bbdd.md).
-- **Particionamiento de `lectura`** por mes cuando se acumule volumen. Ver [`bbdd.md` §10.3](./bbdd.md).
+- **Automatización de particiones** (`pg_partman` + política de retención). El particionamiento en sí ya es parte del MVP (ADR 08); lo que queda es automatizar la creación de futuras particiones y definir cuándo se hace drop de las antiguas. Ver [`bbdd.md` §10.3](./bbdd.md).
+- **Salida de Supabase a Postgres + TimescaleDB self-hosted** si el feedback de hipertablas se vuelve no-negociable. Plan de salida: portar el schema actual (todo el SQL es estándar Postgres salvo la integración con `auth.users`), reemplazar Supabase Auth por uno propio (Authlib + JWT manual), exponer un panel admin custom. Es un movimiento grande — solo se hace si el volumen real supera lo que partición nativa + buenos índices pueden manejar (>500M rows/año o latencias de heatmap >1s).

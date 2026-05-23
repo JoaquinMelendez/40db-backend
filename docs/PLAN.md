@@ -49,17 +49,24 @@ Antes de empezar cualquier paso:
 **Spec:** [`bbdd.md`](./bbdd.md) §12 (plan completo de regeneración, paso a paso).
 
 **Tareas resumidas:**
-- Eliminar `supabase/migrations/20260502225141_initial_schema.sql` y `supabase/seed.sql`.
+- Eliminar `supabase/migrations/20260519000000_initial_schema.sql` (versión previa desalineada) y `supabase/seed.sql`.
 - Crear migración nueva con `supabase migration new initial_schema`.
-- Poblarla siguiendo `bbdd.md` §3, §4, §5.1–5.3, §6 en orden.
-- Reescribir `supabase/seed.sql` (`bbdd.md` §8 + §12.1 paso 4).
+- Poblarla siguiendo `bbdd.md` §3, §4, §5.1–5.4, §6 en orden. **Atención específica:**
+  - `lectura` con `PARTITION BY RANGE (timestamp_medicion)` + PK compuesta `(id, timestamp_medicion)` (D8 en `bbdd.md` §1, detalle en §3.5).
+  - Crear las 8 particiones mensuales (`lectura_2026_05` … `lectura_2026_12`) + `lectura_default` (§3.5.1).
+  - `reporte` con `lectura_evidencia_id` + `lectura_evidencia_timestamp` + FK compuesta + `chk_evidencia_pair` (§3.6).
+  - RPCs `validar_reporte_ruido_top_n` y `crear_reporte_con_validacion` deben devolver el par id+timestamp (§5.2, §5.3).
+- Reescribir `supabase/seed.sql` (`bbdd.md` §8 + §12.1 paso 4). Las lecturas mock deben tener `timestamp_medicion` dentro del rango de alguna partición creada.
 - Aplicar local con `supabase db reset` y verificar (`bbdd.md` §12.1 paso 6).
 
 **Done when:**
 - `supabase db reset` corre sin errores.
 - `\dx` en psql muestra `postgis`.
-- `SELECT * FROM validar_reporte_ruido(...)` y `SELECT * FROM crear_reporte_con_validacion(...)` existen y devuelven datos.
-- `INSERT` duplicado en `lectura` con mismo `(sensor_id, timestamp_medicion)` falla.
+- `\d+ lectura` muestra `Partition key: RANGE (timestamp_medicion)` y lista las particiones.
+- `SELECT tableoid::regclass FROM lectura LIMIT 1` confirma que las filas del seed caen en una partición concreta (no en `lectura_default`).
+- `SELECT * FROM validar_reporte_ruido(...)` y `SELECT * FROM crear_reporte_con_validacion(...)` existen y devuelven datos (incluyendo el par id+timestamp).
+- `INSERT` duplicado en `lectura` con mismo `(sensor_id, timestamp_medicion)` falla con UNIQUE violation.
+- `INSERT INTO reporte` con `lectura_evidencia_id` sin `lectura_evidencia_timestamp` falla por `chk_evidencia_pair`; con par válido funciona.
 
 ---
 
@@ -279,7 +286,8 @@ Pasos 5, 6, 7, 8 son **paralelizables** entre sí una vez completados 1–4.
 Aunque aparezcan en roadmap de otros docs, **no** son parte de este plan:
 
 - `validacion_iot` N:M (`bbdd.md` §10.1).
-- Vistas materializadas / particionamiento (`bbdd.md` §10.3, §10.4).
+- Vistas materializadas (`bbdd.md` §10.4).
+- **Automatización** de creación de particiones con `pg_partman` (`bbdd.md` §10.3). El particionamiento en sí **sí** está en el MVP (paso 1).
 - SSE / WebSockets para heatmap "vivo" (`backend.md` §9).
 - Endpoint admin de promoción de roles (`auth.md` §12).
 - Topics MQTT `status`, `config`, `comandos` (`iot.md` §2.2).
