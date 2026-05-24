@@ -35,8 +35,10 @@ CREATE TABLE usuario (
   id         uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   nombre     text NOT NULL,
   telefono   text,
+  -- D9: tres roles. El admin es cross-comuna; promociones via endpoint
+  -- protegido. SQL manual queda solo como bootstrap del primer admin.
   tipo       text NOT NULL DEFAULT 'ciudadano'
-             CHECK (tipo IN ('ciudadano', 'municipalidad')),
+             CHECK (tipo IN ('ciudadano', 'municipalidad', 'admin')),
   comuna_id  int  REFERENCES comuna(id),
   activo     boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -459,6 +461,85 @@ BEGIN
 END;
 $$;
 
+-- 9.5 Sensores con estado_salud derivado on-demand (bbdd.md §5.5 / D10)
+-- Umbrales: online ≤10min, intermitente ≤20min, offline >20min o !activo,
+-- sin_lecturas si MAX(timestamp_medicion) IS NULL.
+CREATE OR REPLACE FUNCTION public.sensores_con_salud(
+  p_comuna_id int DEFAULT NULL
+)
+RETURNS TABLE (
+  id                uuid,
+  nombre            text,
+  comuna_id         int,
+  latitud           numeric,
+  longitud          numeric,
+  activo            boolean,
+  ultima_lectura_at timestamptz,
+  ultima_lectura_db numeric,
+  estado_salud      text,
+  created_at        timestamptz
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  WITH ultimas AS (
+    SELECT DISTINCT ON (l.sensor_id)
+      l.sensor_id,
+      l.timestamp_medicion AS ts,
+      l.nivel_db
+    FROM lectura l
+    ORDER BY l.sensor_id, l.timestamp_medicion DESC
+  )
+  SELECT
+    s.id,
+    s.nombre,
+    s.comuna_id,
+    s.latitud,
+    s.longitud,
+    s.activo,
+    u.ts,
+    u.nivel_db,
+    CASE
+      WHEN NOT s.activo THEN 'offline'
+      WHEN u.ts IS NULL THEN 'sin_lecturas'
+      WHEN u.ts >= now() - interval '10 minutes' THEN 'online'
+      WHEN u.ts >= now() - interval '20 minutes' THEN 'intermitente'
+      ELSE 'offline'
+    END::text AS estado_salud,
+    s.created_at
+  FROM sensor s
+  LEFT JOIN ultimas u ON u.sensor_id = s.id
+  WHERE (p_comuna_id IS NULL OR s.comuna_id = p_comuna_id)
+  ORDER BY s.nombre;
+END;
+$$;
+
+-- 9.6 KPIs de salud (bbdd.md §5.6)
+CREATE OR REPLACE FUNCTION public.resumen_salud_sensores(
+  p_comuna_id int DEFAULT NULL
+)
+RETURNS TABLE (
+  total        int,
+  online       int,
+  intermitente int,
+  offline      int,
+  sin_lecturas int,
+  calculado_at timestamptz
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    COUNT(*)::int                                                AS total,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'online')::int       AS online,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'intermitente')::int AS intermitente,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'offline')::int      AS offline,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'sin_lecturas')::int AS sin_lecturas,
+    now()                                                        AS calculado_at
+  FROM public.sensores_con_salud(p_comuna_id) s;
+END;
+$$;
+
 -- ----------------------------------------------------------------------------
 -- 10. Row Level Security (habilitado sin políticas — ver bbdd.md §6)
 -- ----------------------------------------------------------------------------
@@ -489,3 +570,16 @@ GRANT EXECUTE                        ON ALL FUNCTIONS IN SCHEMA public TO servic
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES    TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT                   ON SEQUENCES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE                         ON FUNCTIONS TO service_role;
+
+-- ----------------------------------------------------------------------------
+-- 12. Bootstrap del primer admin (manual, auth.md §8.1)
+-- ----------------------------------------------------------------------------
+-- Problema huevo-y-gallina: PATCH /usuarios/{id}/promover requiere ser admin.
+-- El primer admin se promueve via SQL una sola vez, post-signup:
+--
+--   UPDATE public.usuario
+--      SET tipo = 'admin'
+--    WHERE id = '<uuid-del-primer-admin>';
+--
+-- Ese UUID se obtiene tras un signup normal en Supabase Auth. Documentar el
+-- UUID resultante en el README del repo para futuros redeploys del entorno.

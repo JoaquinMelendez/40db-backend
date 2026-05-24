@@ -82,8 +82,27 @@ async def current_user_municipal(
     return user
 
 
+async def current_user_admin(
+    user: Usuario = Depends(current_user),
+) -> Usuario:
+    if user.tipo != "admin":
+        raise ForbiddenError("Se requiere rol admin.")
+    return user
+
+
+async def current_user_municipal_o_admin(
+    user: Usuario = Depends(current_user),
+) -> Usuario:
+    if user.tipo not in ("municipalidad", "admin"):
+        raise ForbiddenError("Se requiere rol municipalidad o admin.")
+    return user
+
+
 def current_user_municipal_de_comuna(comuna_id: int):
-    """Factory: devuelve una dependency que exige ser funcionario de esa comuna."""
+    """Factory: exige ser funcionario de esa comuna. El admin NO bypasea
+    este check — para acciones admin-cross-comuna usar `current_user_admin`
+    o `current_user_municipal_o_admin` y resolver la comuna en el use case.
+    """
     async def _dep(user: Usuario = Depends(current_user_municipal)) -> Usuario:
         if user.comuna_id != comuna_id:
             raise ComunaMismatchError(
