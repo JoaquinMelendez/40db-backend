@@ -517,9 +517,9 @@ Función Postgres que computa el estado de salud de cada sensor en base a la úl
 
 | Estado | Definición |
 |---|---|
-| `online` | última lectura ≤ 10 min |
-| `intermitente` | 10 min < última lectura ≤ 20 min |
-| `offline` | > 20 min sin lectura, **o** `sensor.activo = false` |
+| `online` | última lectura ≤ 1 min |
+| `intermitente` | 1 min < última lectura ≤ 5 min |
+| `offline` | > 5 min sin lectura, **o** `sensor.activo = false` |
 | `sin_lecturas` | sensor sin ninguna lectura en `lectura` (recién provisionado) |
 
 ```sql
@@ -560,8 +560,8 @@ BEGIN
     CASE
       WHEN NOT s.activo THEN 'offline'
       WHEN u.ts IS NULL THEN 'sin_lecturas'
-      WHEN u.ts >= now() - interval '10 minutes' THEN 'online'
-      WHEN u.ts >= now() - interval '20 minutes' THEN 'intermitente'
+      WHEN u.ts >= now() - interval '1 minute'  THEN 'online'
+      WHEN u.ts >= now() - interval '5 minutes' THEN 'intermitente'
       ELSE 'offline'
     END AS estado_salud
   FROM sensor s
