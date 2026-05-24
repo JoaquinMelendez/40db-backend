@@ -18,6 +18,8 @@ Este documento define el **modelo de datos canónico** del backend 40dB: DDL, í
 | D6 | **FK compuesta a `lectura` (no a `sensor`) para evidencia** | `reporte` referencia `(lectura_evidencia_id, lectura_evidencia_timestamp)` contra `(lectura.id, lectura.timestamp_medicion)`. La denormalización del timestamp es **obligatoria** porque `lectura` es particionada (D8) — Postgres exige que toda UNIQUE/PK incluya la partition key, y una FK solo puede apuntar a esa UNIQUE/PK. Navegamos sensor + dB por JOIN sin desnormalizar más. |
 | D7 | **Catálogos pequeños como tablas, no enums** | `comuna`, `tipo_estado`. Permite agregar valores sin migración y referenciarlos por FK. |
 | D8 | **`lectura` particionada por mes desde el inicio (`PARTITION BY RANGE (timestamp_medicion)`)** | Diseñada para escalar a ~30 sensores publicando cada 5–10s. Supabase **no soporta TimescaleDB**, así que se usa partición nativa de Postgres. Particionar desde el día 1 evita una migración dolorosa después (cambiar a partitioned table requiere recrear toda la tabla y FKs). La cadencia mensual cubre ~8–16M rows/partición con el volumen objetivo, manejable por btree/GIST sin presión. |
+| D9 | **Tres roles en `usuario.tipo`: `ciudadano`, `municipalidad`, `admin`** | El admin es cross-comuna y opera CRUD de sensores + gestiona usuarios (promociones, activación). Mantenerlo dentro de `usuario.tipo` como tercer valor del CHECK evita una tabla `rol` separada (overkill para 3 valores discretos sin metadata extra). La promoción a `municipalidad` o `admin` ahora es vía endpoint (`PATCH /usuarios/{id}/promover`) protegido por rol admin — la SQL manual queda solo como bootstrap del primer admin. Ver `auth.md` §8 actualizada. |
+| D10 | **`sensor.estado_salud` se computa on-demand**, no se persiste | Vista de salud (`online` / `intermitente` / `offline`) se deriva en cada `GET /sensores` desde `MAX(timestamp_medicion)` por sensor. El índice `idx_lectura_sensor_timestamp` ya existe → query <5ms con volumen MVP. Cero estado mutable, sin worker, sin drift. Umbrales en §5.5 (`estado_salud_sensor`). Si crece a >100 sensores y se vuelve hotspot, evaluar vista materializada (no en MVP). |
 
 ---
 
@@ -87,7 +89,7 @@ CREATE TABLE usuario (
   nombre      text NOT NULL,
   telefono    text,
   tipo        text NOT NULL DEFAULT 'ciudadano'
-              CHECK (tipo IN ('ciudadano', 'municipalidad')),
+              CHECK (tipo IN ('ciudadano', 'municipalidad', 'admin')),
   comuna_id   int REFERENCES comuna(id),
   activo      boolean NOT NULL DEFAULT true,
   created_at  timestamptz NOT NULL DEFAULT now(),
@@ -266,7 +268,7 @@ Aplicado a `usuario`, `reporte`, `sensor`. Evita olvidos en UPDATEs manuales.
 
 ## 5. RPCs (funciones Postgres)
 
-Cuatro funciones PL/pgSQL viven en la DB. Todas se invocan desde Python con `supabase_client.rpc(<nombre>, params)`:
+Seis funciones PL/pgSQL viven en la DB. Todas se invocan desde Python con `supabase_client.rpc(<nombre>, params)`:
 
 | Función | Para qué | Llamada desde |
 |---|---|---|
@@ -274,8 +276,10 @@ Cuatro funciones PL/pgSQL viven en la DB. Todas se invocan desde Python con `sup
 | `validar_reporte_ruido_top_n` | Top-N para anti-forgery | (interno, dentro de §5.3) |
 | `crear_reporte_con_validacion` | Insert + validación atómica | `POST /reportes` |
 | `heatmap_agregado` | Agregación por celda + bucket | `GET /heatmaps` |
+| `sensores_con_salud` | Lista sensores con `estado_salud` derivado on-demand | `GET /sensores`, `GET /sensores/{id}` |
+| `resumen_salud_sensores` | KPIs agregados (online/intermitente/offline/sin_lecturas) | `GET /sensores/resumen` |
 
-Las tres primeras encapsulan **reglas de negocio** (criterios geo-temporales, transiciones del modelo, atomicidad). La cuarta es **agregación pura** sobre `lectura` — vive como función Postgres porque `supabase-py` no expone SQL raw parametrizado, no por encapsulamiento de reglas. La alternativa sería `psycopg2` + `POSTGRES_URL`, descartada por agregar un cliente y un path de credenciales paralelos para un solo query.
+Las tres primeras encapsulan **reglas de negocio** (criterios geo-temporales, transiciones del modelo, atomicidad). La cuarta es **agregación pura** sobre `lectura`, vive como función Postgres porque `supabase-py` no expone SQL raw parametrizado. Las dos últimas (D10) computan el estado de salud del sensor on-demand desde `MAX(timestamp_medicion)` por sensor — no encapsulan reglas, solo aprovechan el índice `idx_lectura_sensor_timestamp` para responder rápido sin estado persistido.
 
 ### 5.1 `validar_reporte_ruido` (single, para preview)
 
@@ -505,6 +509,102 @@ $$;
 - El `0.001°` (~100 m al ecuador, menos a latitudes altas) viene de `settings.HEATMAP_GRID_SIZE_DEG`.
 - La validación de límites (`bucket_minutes ∈ {1,5,15,60}`, ventana ≤ 7 días, bbox válido) vive en el use case Python (`app/application/obtener_heatmap.py`), no en SQL — son reglas de **dominio del endpoint**, no de la agregación.
 
+### 5.5 `estado_salud_sensor` (cálculo on-demand por sensor)
+
+Función Postgres que computa el estado de salud de cada sensor en base a la última lectura recibida (D10). La invoca `SensorRepository.listar(...)` con o sin filtro de comuna; también es la base de `resumen_salud_sensores` (§5.6).
+
+**Umbrales** (fijos en el RPC; si en el futuro se quieren configurables, mover a parámetros):
+
+| Estado | Definición |
+|---|---|
+| `online` | última lectura ≤ 10 min |
+| `intermitente` | 10 min < última lectura ≤ 20 min |
+| `offline` | > 20 min sin lectura, **o** `sensor.activo = false` |
+| `sin_lecturas` | sensor sin ninguna lectura en `lectura` (recién provisionado) |
+
+```sql
+CREATE OR REPLACE FUNCTION public.sensores_con_salud(
+  p_comuna_id int DEFAULT NULL
+)
+RETURNS TABLE (
+  id                 uuid,
+  nombre             text,
+  comuna_id          int,
+  latitud            numeric,
+  longitud           numeric,
+  activo             boolean,
+  ultima_lectura_at  timestamptz,
+  ultima_lectura_db  numeric,
+  estado_salud       text
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  WITH ultimas AS (
+    SELECT DISTINCT ON (l.sensor_id)
+      l.sensor_id,
+      l.timestamp_medicion AS ts,
+      l.nivel_db
+    FROM lectura l
+    ORDER BY l.sensor_id, l.timestamp_medicion DESC
+  )
+  SELECT
+    s.id,
+    s.nombre,
+    s.comuna_id,
+    s.latitud,
+    s.longitud,
+    s.activo,
+    u.ts,
+    u.nivel_db,
+    CASE
+      WHEN NOT s.activo THEN 'offline'
+      WHEN u.ts IS NULL THEN 'sin_lecturas'
+      WHEN u.ts >= now() - interval '10 minutes' THEN 'online'
+      WHEN u.ts >= now() - interval '20 minutes' THEN 'intermitente'
+      ELSE 'offline'
+    END AS estado_salud
+  FROM sensor s
+  LEFT JOIN ultimas u ON u.sensor_id = s.id
+  WHERE (p_comuna_id IS NULL OR s.comuna_id = p_comuna_id)
+  ORDER BY s.nombre;
+END;
+$$;
+```
+
+**Performance.** El `DISTINCT ON (sensor_id)` con `ORDER BY sensor_id, timestamp_medicion DESC` usa el índice `idx_lectura_sensor_timestamp` directo (lookup → leaf más reciente), evitando un scan de partición. Costo: O(N sensores × log lecturas). Con 1-30 sensores: <5ms.
+
+### 5.6 `resumen_salud_sensores` (KPIs admin)
+
+Agregación del resultado de §5.5. La invoca `GET /api/v1/sensores/resumen` (`api.md` §4.16).
+
+```sql
+CREATE OR REPLACE FUNCTION public.resumen_salud_sensores(
+  p_comuna_id int DEFAULT NULL
+)
+RETURNS TABLE (
+  total          int,
+  online         int,
+  intermitente   int,
+  offline        int,
+  sin_lecturas   int,
+  calculado_at   timestamptz
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    COUNT(*)::int                                                    AS total,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'online')::int           AS online,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'intermitente')::int     AS intermitente,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'offline')::int          AS offline,
+    COUNT(*) FILTER (WHERE s.estado_salud = 'sin_lecturas')::int     AS sin_lecturas,
+    now()                                                            AS calculado_at
+  FROM public.sensores_con_salud(p_comuna_id) s;
+END;
+$$;
+```
+
 ---
 
 ## 6. Row Level Security (RLS)
@@ -675,14 +775,14 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
 3. **Poblar** el nuevo archivo SQL con, en este orden:
    - §3.1 Extensiones (`postgis`).
    - §3.2 Catálogos (`comuna`, `tipo_estado`).
-   - §3.3 `usuario`.
+   - §3.3 `usuario` (con CHECK extendido a 3 roles: `ciudadano`, `municipalidad`, `admin` — D9).
    - §3.4 `sensor` (con `ubicacion` generada + GIST).
    - §3.5 `lectura` **particionada** (`PARTITION BY RANGE (timestamp_medicion)`) + PK compuesta + UNIQUE `(sensor_id, timestamp_medicion)`.
    - §3.5.1 Crear particiones mensuales para 2026-05 … 2026-12 + `lectura_default`.
    - §3.6 `reporte` (con `ubicacion` generada + `lectura_evidencia_id` + `lectura_evidencia_timestamp` + FK compuesta + `chk_evidencia_pair` + GIST).
    - §3.7 `historial_estado`.
    - §4 Triggers (`handle_new_user`, `set_initial_estado`, `set_updated_at`).
-   - §5.1–5.4 RPCs (incluye `heatmap_agregado`; `crear_reporte_con_validacion` devuelve el par id+timestamp).
+   - §5.1–5.6 RPCs (incluye `heatmap_agregado`, `sensores_con_salud`, `resumen_salud_sensores`; `crear_reporte_con_validacion` devuelve el par id+timestamp).
    - §6 RLS enable.
 4. **Reescribir** `supabase/seed.sql` con: catálogo `tipo_estado`, 3 comunas, 3 sensores con `latitud/longitud` válidos (la columna `ubicacion` se genera automáticamente), unas lecturas mock, sin `validacion_iot`.
 5. **Aplicar local:**
@@ -696,6 +796,9 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
    - `INSERT` duplicado en `lectura` con mismo `(sensor_id, timestamp_medicion)` falla con UNIQUE violation.
    - Un `INSERT INTO lectura` con `timestamp_medicion` dentro de mayo 2026 cae en `lectura_2026_05` (`SELECT tableoid::regclass, * FROM lectura LIMIT 1;` confirma).
    - `INSERT INTO reporte (..., lectura_evidencia_id, lectura_evidencia_timestamp)` con par válido funciona; con par solo-id-o-solo-timestamp falla por `chk_evidencia_pair`; con id+timestamp inexistentes falla por la FK compuesta.
+   - `INSERT INTO usuario (..., tipo) VALUES (..., 'admin')` funciona (CHECK extendido a 3 roles); `tipo='superadmin'` falla.
+   - `SELECT * FROM sensores_con_salud();` retorna cada sensor con `estado_salud` calculado (sensor del seed sin lecturas frescas debería aparecer como `sin_lecturas` o `offline` según haya o no rows en `lectura`).
+   - `SELECT * FROM resumen_salud_sensores();` retorna 1 row con `total`, `online`, `intermitente`, `offline`, `sin_lecturas`, `calculado_at`.
 7. **Aplicar remoto** (cuando esté linkeado el proyecto):
    ```bash
    supabase db push
