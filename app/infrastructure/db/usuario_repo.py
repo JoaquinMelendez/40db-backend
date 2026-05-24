@@ -87,3 +87,61 @@ class UsuarioRepository:
             return _row_to_usuario(result.data[0])
         except Exception as e:
             raise ExternalServiceError(f"Error al promover usuario: {e}") from e
+
+    def _fetch_email(self, user_id: str) -> Optional[str]:
+        """Lookup de email desde auth.users via supabase admin API.
+
+        N+1 controlado: solo se invoca sobre la página devuelta (max 100).
+        Si en el futuro pesa, mover a un RPC con JOIN auth.users.email.
+        """
+        try:
+            res = self._db.auth.admin.get_user_by_id(user_id)
+        except Exception:
+            return None
+        user = getattr(res, "user", None) if res is not None else None
+        return getattr(user, "email", None) if user else None
+
+    def listar(
+        self,
+        tipo: Optional[str],
+        comuna_id: Optional[int],
+        activo: Optional[bool],
+        q: Optional[str],
+        limit: int,
+        cursor: Optional[str],
+    ) -> tuple[list[Usuario], Optional[str]]:
+        from app.domain.errors import ExternalServiceError
+        try:
+            query = (
+                self._db.table("usuario")
+                .select("*")
+                .order("created_at", desc=True)
+                .order("id", desc=True)
+                .limit(limit + 1)
+            )
+            if tipo is not None:
+                query = query.eq("tipo", tipo)
+            if comuna_id is not None:
+                query = query.eq("comuna_id", comuna_id)
+            if activo is not None:
+                query = query.eq("activo", activo)
+            if q:
+                # MVP: solo búsqueda por nombre. La búsqueda por email
+                # requeriría JOIN a auth.users — pendiente para cuando
+                # exista un RPC dedicado o vista materializada.
+                query = query.ilike("nombre", f"%{q}%")
+            if cursor:
+                ca, _rid = _decode_cursor(cursor)
+                query = query.lt("created_at", ca)
+
+            rows = query.execute().data or []
+        except Exception as e:
+            raise ExternalServiceError(f"Error listando usuarios: {e}") from e
+
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            last = rows[-1]
+            next_cursor = _encode_cursor(last["created_at"], last["id"])
+
+        return [_row_to_usuario(row, email=self._fetch_email(row["id"])) for row in rows], next_cursor
