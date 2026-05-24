@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     heatmap_grid_size_deg: float = 0.001
     heatmap_max_window_days: int = 7
 
+    # Storage: archivos generados desde el panel admin (PDF/CSV/imagen).
+    # Bucket privado; URLs de descarga firmadas con duración corta.
+    storage_bucket_reportes_admin: str = "reportes-admin"
+    storage_signed_url_ttl_seconds: int = 300
+    archivo_max_size_mb: int = 20
+
     # ── MQTT (opcionales) ─────────────────────────────────────────────────────
     mqtt_broker_url: Optional[str] = None
     mqtt_user: Optional[str] = None
