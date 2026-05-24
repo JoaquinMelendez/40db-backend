@@ -23,7 +23,7 @@ async def heatmap(
         raise DomainValidationError("bbox debe tener formato minLng,minLat,maxLng,maxLat.")
 
     from app.application.obtener_heatmap import obtener_heatmap
-    rows = obtener_heatmap(
+    rows, fuente = obtener_heatmap(
         min_lng=min_lng, min_lat=min_lat,
         max_lng=max_lng, max_lat=max_lat,
         time_start=time_start, time_end=time_end,
@@ -52,6 +52,7 @@ async def heatmap(
             "bucket_minutes": bucket_minutes,
             "grid_size_deg": settings.heatmap_grid_size_deg,
             "total_cells": len(features),
+            "fuente": fuente,
         },
         "features": features,
     })

@@ -87,6 +87,30 @@ El backend de 40dB resuelve un sistema **híbrido transaccional + telemetría en
 - El `MqttIngestor` no se entera.
 - Las queries del heatmap (RPC `heatmap_agregado`) hacen partition pruning automático con el filtro `WHERE timestamp_medicion BETWEEN …`.
 
+### ADR 09 — Capa de agregación intra-Postgres (rollups horarios + matview heatmap)
+**Decisión.** Se agrega una capa **OLAP precomputada** dentro de la misma instancia Postgres:
+- Tabla `lectura_resumen_horaria` (rollup horario por sensor: avg/min/max/p95/n) refrescada vía función SQL idempotente + `pg_cron` cada hora.
+- Vista materializada `mv_heatmap_celda_bucket` (celdas de 0.001° × buckets de 5 min × últimos 7 días) refrescada con `REFRESH … CONCURRENTLY` cada 15 min.
+
+No se introduce stack big-data externo (no Spark, no DuckDB, no Kafka, no data lake). Toda la capa vive en Supabase free.
+
+**Por qué.**
+- Con volumen objetivo de ~100M rows/año en `lectura` (ADR 08), servir series temporales y heatmaps escaneando datos crudos en cada GET se vuelve insostenible más allá del prototipo.
+- Es requisito académico explícito del proyecto de título exponer una **componente de big data** defendible. Esta capa cubre las 3 V (volumen, velocidad, variedad) con el patrón clásico de **downsampling de time-series + agregación geoespacial precomputada + scheduling declarativo (cron-as-SQL)**, sin agregar infraestructura ni romper el principio "single process" (ADR 01–03).
+- Costo monetario en free tier: $0. Costo en footprint de tabla: ~20 MB para el rollup horario y ~60k rows en la matview de heatmap. Cabe holgado en los 500 MB del plan free de Supabase.
+
+**Consecuencias.**
+1. Migración nueva separada de la inicial (los rollups dependen de tener `lectura` cargada con datos representativos). Ver [`bbdd.md`](./bbdd.md) §13 para DDL, función y schedule.
+2. Nuevo puerto `ResumenHorarioRepository` (en `domain/ports.py`) + adapter `SupabaseResumenHorarioRepository`. Use case `obtener_resumen_horario` sirve `GET /api/v1/lecturas/resumen` ([`api.md`](./api.md) §4.27).
+3. El adapter `LecturaRepository.heatmap(...)` decide internamente entre matview (`bucket_minutes=5`, ventana ≤ 7 días) y RPC `heatmap_agregado` (resto de combinaciones). El use case `obtener_heatmap` no se entera — sigue el principio de hexagonal lite (ADR 06).
+4. `pg_cron` se vuelve dependencia operacional: si un job falla repetidamente, los agregados quedan stale. Visibilidad vía `SELECT * FROM cron.job_run_details`. No se expone en `/health/ready` (corre dentro de Postgres, no del proceso FastAPI), pero el response del endpoint `/lecturas/resumen` incluye `refrescado_at` para que el cliente detecte staleness.
+5. Free tier de Supabase **auto-pausa el proyecto tras 7 días sin actividad** → `pg_cron` deja de correr. Mitigación: cualquier tráfico HTTP/MQTT lo despierta. Para producción real, plan Pro ($25/mo).
+
+**Lo que NO se agrega (explícito).**
+- No se exportan los rollups a Parquet/S3/data lake externo.
+- No hay job de detección de anomalías ni streaming analytics (Kafka/Flink/etc.). Está como opción futura ([`bbdd.md`](./bbdd.md) §10 roadmap si se redocumenta).
+- No se usa `pg_partman` aún (las particiones de `lectura` siguen siendo manuales, ADR 08).
+
 ---
 
 ## 3. Estructura del proyecto
@@ -252,7 +276,7 @@ El flujo combina **preview opcional iniciado por el usuario** (UX) y **validaci�
 4. Cada row del resultado se serializa a un `Feature` GeoJSON con `Point` en el centro de la celda + properties (`nivel_db_avg`, `nivel_db_max`, `lectura_count`, `bucket_start`).
 5. Response: `FeatureCollection` con metadata (`bucket_minutes`, `grid_size_deg`, `total_cells`).
 
-**Performance.** Con índice `idx_lectura_timestamp` + `idx_sensor_ubicacion` (GIST), un bbox urbano sobre 24 h se resuelve en O(100 ms). Si crece volumen y se nota lentitud, primero subir el `bucket_minutes` mínimo permitido; si aún no alcanza, ir a vista materializada (`bbdd.md` §10.4) o particionamiento (`bbdd.md` §10.3).
+**Performance.** Con índice `idx_lectura_timestamp` + `idx_sensor_ubicacion` (GIST), un bbox urbano sobre 24 h escaneando `lectura` cruda se resuelve en O(100 ms). Para la combinación más común (`bucket_minutes=5`, ventana dentro de los últimos 7 días) el adapter sirve desde **`mv_heatmap_celda_bucket`** (matview refrescada cada 15 min, ver [`bbdd.md` §13](./bbdd.md) y ADR 09) — orden de magnitud más rápido y con presión cero sobre la tabla particionada. Para ventanas custom o `bucket_minutes ∈ {1, 15, 60}`, sigue cayendo al RPC original.
 
 **Caching.** Sin cache en MVP. Si se vuelve hotspot, agregar `Cache-Control: public, max-age=60` y/o un cache en memoria por hash de query.
 
@@ -338,7 +362,7 @@ Cambios postergados pero documentados:
 - **Validación IoT N:M** con score y método (auto/manual). Ver [`bbdd.md` §10.1](./bbdd.md). Requiere reintroducir tabla `validacion_iot`.
 - **SSE para heatmap "vivo"** si surge requerimiento UX.
 - **Matching reactivo de reportes en espera** al llegar lecturas altas (no implementado; el flujo actual es pull, ver §5.1 / §5.2).
-- **Vista materializada** para heatmap si performance lo exige. Ver [`bbdd.md` §10.4](./bbdd.md).
+- ~~**Vista materializada** para heatmap si performance lo exige~~ — **incorporada al MVP como ADR 09**, ver [`bbdd.md` §13](./bbdd.md).
 - **Automatización de particiones** (`pg_partman` + política de retención). El particionamiento en sí ya es parte del MVP (ADR 08); lo que queda es automatizar la creación de futuras particiones y definir cuándo se hace drop de las antiguas. Ver [`bbdd.md` §10.3](./bbdd.md).
 - **Salida de Supabase a Postgres + TimescaleDB self-hosted** si el feedback de hipertablas se vuelve no-negociable. Plan de salida: portar el schema actual (todo el SQL es estándar Postgres salvo la integración con `auth.users`), reemplazar Supabase Auth por uno propio (Authlib + JWT manual), exponer un panel admin custom. Es un movimiento grande — solo se hace si el volumen real supera lo que partición nativa + buenos índices pueden manejar (>500M rows/año o latencias de heatmap >1s).
 - **Categoría en reportes** (`reporte.categoria`). Pedido por frontend (`integracion-backend/02-endpoints-faltantes-back.md §4`). Trivial cuando se decida — `ALTER TABLE reporte ADD COLUMN categoria text CHECK (...)` + campo opcional en `POST /reportes`.

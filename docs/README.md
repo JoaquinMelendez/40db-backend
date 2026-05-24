@@ -15,6 +15,7 @@ Punto de entrada a la documentación del backend. Está pensada como **especific
 | 5 | [`errores.md`](./errores.md) | Jerarquía de excepciones de dominio, mapeo HTTP, health checks, manejo de fallos externos. |
 | 6 | [`iot.md`](./iot.md) | Contrato MQTT con el subsistema IoT (lo implementa otro miembro del equipo). |
 | 7 | [`PLAN.md`](./PLAN.md) | **Orden de implementación con dependencias.** Esto es lo que se ejecuta. |
+| 8 | [`frontend-resumen-horario.md`](./frontend-resumen-horario.md) | Instrucciones para que el frontend Vue 3 integre el endpoint `/lecturas/resumen` + heatmap optimizado (capa OLAP — ADR 09). |
 
 ---
 

@@ -45,7 +45,8 @@ INSERT INTO comuna (nombre, region, codigo) VALUES
   ('San Joaquín',         'Metropolitana', '13129'),
   ('San Miguel',          'Metropolitana', '13130'),
   ('San Ramón',           'Metropolitana', '13131'),
-  ('Vitacura',            'Metropolitana', '13132');
+  ('Vitacura',            'Metropolitana', '13132')
+ON CONFLICT (codigo) DO NOTHING;
 
 -- Sensores mock (ubición referencial en el centro de cada comuna)
 -- Nota: la columna `ubicacion` geography se genera automáticamente desde lat/lng
