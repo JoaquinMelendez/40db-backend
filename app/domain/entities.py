@@ -7,10 +7,11 @@ from typing import Optional
 class Usuario:
     id: str
     nombre: str
-    tipo: str                    # 'ciudadano' | 'municipalidad'
+    tipo: str                    # 'ciudadano' | 'municipalidad' | 'admin'
     activo: bool
     telefono: Optional[str] = None
     comuna_id: Optional[int] = None
+    email: Optional[str] = None  # JOIN a auth.users.email (solo en listados admin)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -23,6 +24,13 @@ class Sensor:
     latitud: float
     longitud: float
     activo: bool
+    # Derivados on-demand vía RPC sensores_con_salud (D10 en bbdd.md).
+    # None cuando se hidrata desde tabla sin pasar por la RPC.
+    estado_salud: Optional[str] = None
+    ultima_lectura_at: Optional[datetime] = None
+    ultima_lectura_db: Optional[float] = None
+    comuna_nombre: Optional[str] = None
+    created_at: Optional[datetime] = None
 
 
 @dataclass
