@@ -10,11 +10,42 @@ INSERT INTO tipo_estado (nombre, descripcion, orden) VALUES
   ('Atendido',    'Reporte resuelto',                3),
   ('Descartado',  'Reporte invalido o duplicado',    4);
 
--- Comunas de prueba
+-- Catálogo de comunas: las 32 comunas de la Provincia de Santiago (Gran Santiago).
+-- Códigos INE oficiales. El front matchea contra `nombre` (case-insensitive y
+-- sin tildes vía Nominatim reverse-geocode, ver api.md §4.5.1).
 INSERT INTO comuna (nombre, region, codigo) VALUES
-  ('Santiago',    'Metropolitana', '13101'),
-  ('Providencia', 'Metropolitana', '13123'),
-  ('Las Condes',  'Metropolitana', '13114');
+  ('Santiago',            'Metropolitana', '13101'),
+  ('Cerrillos',           'Metropolitana', '13102'),
+  ('Cerro Navia',         'Metropolitana', '13103'),
+  ('Conchalí',            'Metropolitana', '13104'),
+  ('El Bosque',           'Metropolitana', '13105'),
+  ('Estación Central',    'Metropolitana', '13106'),
+  ('Huechuraba',          'Metropolitana', '13107'),
+  ('Independencia',       'Metropolitana', '13108'),
+  ('La Cisterna',         'Metropolitana', '13109'),
+  ('La Florida',          'Metropolitana', '13110'),
+  ('La Granja',           'Metropolitana', '13111'),
+  ('La Pintana',          'Metropolitana', '13112'),
+  ('La Reina',            'Metropolitana', '13113'),
+  ('Las Condes',          'Metropolitana', '13114'),
+  ('Lo Barnechea',        'Metropolitana', '13115'),
+  ('Lo Espejo',           'Metropolitana', '13116'),
+  ('Lo Prado',            'Metropolitana', '13117'),
+  ('Macul',               'Metropolitana', '13118'),
+  ('Maipú',               'Metropolitana', '13119'),
+  ('Ñuñoa',               'Metropolitana', '13120'),
+  ('Pedro Aguirre Cerda', 'Metropolitana', '13121'),
+  ('Peñalolén',           'Metropolitana', '13122'),
+  ('Providencia',         'Metropolitana', '13123'),
+  ('Pudahuel',            'Metropolitana', '13124'),
+  ('Quilicura',           'Metropolitana', '13125'),
+  ('Quinta Normal',       'Metropolitana', '13126'),
+  ('Recoleta',            'Metropolitana', '13127'),
+  ('Renca',               'Metropolitana', '13128'),
+  ('San Joaquín',         'Metropolitana', '13129'),
+  ('San Miguel',          'Metropolitana', '13130'),
+  ('San Ramón',           'Metropolitana', '13131'),
+  ('Vitacura',            'Metropolitana', '13132');
 
 -- Sensores mock (ubición referencial en el centro de cada comuna)
 -- Nota: la columna `ubicacion` geography se genera automáticamente desde lat/lng
