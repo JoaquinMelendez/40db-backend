@@ -24,11 +24,12 @@ class ForbiddenError(DomainError):
 
 class ValidationError(DomainError):
     code = "validation_error"
-    http_status = 409
+    http_status = 422
 
 
 class InvalidStateTransitionError(ValidationError):
     code = "invalid_state_transition"
+    http_status = 409
 
 
 class ConflictError(DomainError):

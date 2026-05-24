@@ -21,6 +21,9 @@ class CrearReporteRequest(BaseModel):
     descripcion: str = Field(min_length=10, max_length=2000)
     latitud: float = Field(ge=-90, le=90)
     longitud: float = Field(ge=-180, le=180)
+    # api.md §4.5.1: cliente resuelve via Nominatim. Si viene, server valida
+    # contra catalogo. Si no, fallback a usuario.comuna_id.
+    comuna_id: Optional[int] = None
     lectura_evidencia_id: Optional[int] = None
 
 
