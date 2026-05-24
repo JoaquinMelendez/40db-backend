@@ -332,6 +332,65 @@ Antes de empezar cualquier paso:
 
 ---
 
+## Paso 14 — Capa de agregación OLAP (rollups horarios + matview heatmap)
+
+**Dependencias:** paso 1 (DB con `lectura` particionada), paso 4 (auth), paso 6 (ingestor MQTT corriendo) y paso 7 (endpoint `/heatmaps` funcionando). Recomendable hacerlo **después de tener al menos algunas horas de lecturas reales o seed** — si la matview se crea sobre cero rows queda válida pero vacía.
+
+**Spec:** [`bbdd.md`](./bbdd.md) §13 + [`api.md`](./api.md) §4.27 + [`backend.md`](./backend.md) ADR 09.
+
+**Motivación.** Componente de **big data lite** del proyecto: agregaciones precomputadas dentro de Postgres para escalar a ~100M rows/año de `lectura` sin agregar infra externa. Cero costo en Supabase free.
+
+**Sub-pasos:**
+
+### 14a. Migración SQL
+
+- Crear migración nueva: `supabase migration new agregacion_olap`.
+- Poblar siguiendo [`bbdd.md`](./bbdd.md) §13 en orden:
+  - §13.1 `CREATE TABLE lectura_resumen_horaria` + 2 índices.
+  - §13.2 `CREATE OR REPLACE FUNCTION refrescar_resumen_horario(...)`.
+  - §13.3 `CREATE MATERIALIZED VIEW mv_heatmap_celda_bucket` + UNIQUE index + btree index.
+  - §13.4 `CREATE EXTENSION IF NOT EXISTS pg_cron;` + 2 `cron.schedule(...)`.
+- **Habilitar `pg_cron` en Supabase Dashboard** (Database → Extensions → pg_cron) si no está activo. La extensión vive en la base `postgres`.
+- Hacer una corrida manual antes de confiar en el cron:
+  ```sql
+  SELECT refrescar_resumen_horario('2026-05-01'::timestamptz);
+  REFRESH MATERIALIZED VIEW CONCURRENTLY mv_heatmap_celda_bucket;
+  ```
+
+### 14b. Capa hexagonal del nuevo endpoint
+
+- `app/domain/entities.py`: agregar dataclass `ResumenHorario` (`sensor_id`, `hora`, `avg_db`, `min_db`, `max_db`, `p95_db`, `n_lecturas`, `refrescado_at`).
+- `app/domain/ports.py`: `Protocol ResumenHorarioRepository` con `listar(sensor_id, desde, hasta) -> list[ResumenHorario]`.
+- `app/infrastructure/db/resumen_horario_repo.py`: `SupabaseResumenHorarioRepository` que hace `SELECT … FROM lectura_resumen_horaria WHERE sensor_id=… AND hora >= … AND hora < … ORDER BY hora`.
+- `app/application/obtener_resumen_horario.py`: use case que valida ventana ≤ 90 días, verifica que el sensor existe, aplica regla de comuna (municipalidad solo su comuna, admin todas) y arma el DTO.
+- `app/api/schemas/lectura.py`: Pydantic schemas request/response del shape de [`api.md`](./api.md) §4.27.
+- `app/api/routes/lecturas.py`: route nueva con `Depends(current_user_municipal_o_admin)`.
+
+### 14c. Optimización del endpoint `/heatmaps` para usar la matview
+
+- En `app/infrastructure/db/lectura_repo.py`, dentro de `LecturaRepository.heatmap(...)`:
+  - **Si** `bucket_minutes == 5` **y** ambos timestamps están dentro de `now() - interval '7 days'` → `SELECT … FROM mv_heatmap_celda_bucket WHERE lng_cell BETWEEN … AND lat_cell BETWEEN … AND bucket_start BETWEEN …`.
+  - **Si no** → `rpc('heatmap_agregado', …)` (camino actual).
+- El use case `obtener_heatmap` y el route **no cambian** — la decisión es 100% adapter (hexagonal lite).
+- Agregar campo informativo al response: `metadata.fuente ∈ {"matview", "rpc"}` para debug.
+
+### 14d. Verificación operacional
+
+- `SELECT * FROM cron.job;` lista los 2 jobs (`refrescar_resumen_horario`, `refrescar_mv_heatmap`).
+- `SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;` muestra runs sin errores.
+- Provocar una lectura nueva via MQTT, esperar al minuto 5 de la próxima hora, verificar que `lectura_resumen_horaria` tiene una row para ese sensor + hora.
+- `EXPLAIN ANALYZE` del query del heatmap con params en ventana matview → confirma `Seq Scan on mv_heatmap_celda_bucket` (o index scan), no `Append … lectura_2026_*`.
+
+**Done when:**
+- `GET /api/v1/lecturas/resumen?sensor_id=…&desde=…&hasta=…` devuelve el shape de [`api.md`](./api.md) §4.27.
+- Como `municipalidad`, sensor de otra comuna → 403.
+- Ventana > 90 días → 422.
+- `GET /api/v1/heatmaps` con `bucket_minutes=5` y ventana de 24 h en los últimos 7 días devuelve resultados idénticos al del path RPC (comparar sobre seed data), pero con `metadata.fuente = "matview"`.
+- `GET /api/v1/heatmaps` con `bucket_minutes=60` o ventana fuera de los 7 días devuelve `metadata.fuente = "rpc"`.
+- Los 2 jobs de `pg_cron` corren al menos una vez sin errores (`cron.job_run_details.status = 'succeeded'`).
+
+---
+
 ## Resumen visual de dependencias
 
 ```
@@ -373,6 +432,8 @@ Pasos 10–13 vienen después y se acoplan así:
     └──▶ 12. Endpoints usuarios (admin)
 
 13. comuna_id en POST /reportes   ◀── independiente, edita lo existente del paso 5
+
+14. Capa OLAP (rollups + matview)  ◀── requiere 1, 4, 6, 7 (todo el pipeline IoT vivo)
 ```
 
 ---
@@ -382,7 +443,7 @@ Pasos 10–13 vienen después y se acoplan así:
 Aunque aparezcan en roadmap de otros docs, **no** son parte de este plan:
 
 - `validacion_iot` N:M (`bbdd.md` §10.1).
-- Vistas materializadas (`bbdd.md` §10.4).
+- ~~Vistas materializadas (`bbdd.md` §10.4)~~ — **promovida al MVP en el paso 14** (capa OLAP).
 - **Automatización** de creación de particiones con `pg_partman` (`bbdd.md` §10.3). El particionamiento en sí **sí** está en el MVP (paso 1).
 - SSE / WebSockets para heatmap "vivo" (`backend.md` §9).
 - Endpoint admin de promoción de roles (`auth.md` §12).
