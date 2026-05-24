@@ -52,6 +52,21 @@ class EvidenciaIot:
 
 
 @dataclass
+class ReporteArchivoAdmin:
+    id: str
+    generado_por_id: str
+    nombre: str
+    tipo: str                      # 'pdf' | 'csv' | 'imagen'
+    mime_type: str
+    tamano_bytes: int
+    object_path: str               # key dentro del bucket Supabase Storage
+    rango_desde: Optional[datetime] = None
+    rango_hasta: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    generado_por_nombre: Optional[str] = None  # hidratado en listados
+
+
+@dataclass
 class Reporte:
     id: str
     usuario_id: str
