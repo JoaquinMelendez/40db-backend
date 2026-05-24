@@ -20,17 +20,20 @@ Documento del **contrato MQTT** entre los sensores acústicos (firmware ESP32 + 
 
 Snapshot del `.ino` actual contra lo que este documento exige. Cada fila bloqueante (🔴) impide que un mensaje del firmware se ingeste correctamente; las 🟡 son aceptables temporalmente pero deben cerrarse antes de producción.
 
-| Aspecto | Firmware actual (`.ino`) | Contrato (este doc) | Sev. |
-|---|---|---|---|
-| Topic | `40db/sensors/UE-MAI-0001/readings` | `40db/sensores/{sensor_id}/lectura` (§2.1) | 🔴 |
-| `sensor_id` en el topic | slug humano `UE-MAI-0001` | UUID de `public.sensor.id` (§2.1, §3.1) | 🔴 |
-| Campo dB en el payload | `db` | `nivel_db` (§3.1) | 🔴 |
-| `timestamp_medicion` | `millis()` (uptime del MCU) | ISO 8601 UTC con NTP (§3.1, §6.2) | 🔴 |
-| Campos extra en payload | `sensor_id`, `geo: {lat, lng}` | solo `nivel_db` + `timestamp_medicion` (§3.1) | 🟡 (backend ignora silencioso) |
-| QoS | 0 (default `PubSubClient`) | 1 (§1, I5) | 🟡 (afecta idempotencia) |
-| TLS | `setInsecure()` (sin verificación de cert) | TLS con verificación (§1, I9) | 🟡 |
-| Frecuencia | 5s fijo | 10s base, ráfaga 2s al superar 80 dB (§4) | 🟢 (aceptable) |
-| Auth MQTT | credencial compartida (`40db-sensor`) | per-sensor recomendado (§5.1) | 🟢 (§5.2 lo admite) |
+**Estado de cierre (2026-05-23):** las 4 🔴 quedaron resueltas al ejecutar §10. Las 🟡 (QoS y TLS) se mantienen abiertas como deuda técnica documentada por las restricciones de `PubSubClient` (no soporta QoS 1) y por simplicidad operacional MVP (TLS sin verificación de cert, aceptable para data acústica no sensible). Adicionalmente, el módulo KY-038 físico resultó dañado y el firmware corre actualmente en **modo simulación** (random walk en torno a baseline urbano) — esto NO es divergencia del contrato (el payload sigue siendo correcto), solo del hardware. Reemplazar por módulo nuevo cierra ese item.
+
+| Aspecto | Firmware actual (`.ino`) | Contrato (este doc) | Sev. | Estado |
+|---|---|---|---|---|
+| Topic | `40db/sensores/{uuid}/lectura` | `40db/sensores/{sensor_id}/lectura` (§2.1) | 🔴 | ✅ cerrado en §10.4 punto 3 |
+| `sensor_id` en el topic | UUID `d26bc4d1-…` de `public.sensor` | UUID (§2.1, §3.1) | 🔴 | ✅ cerrado en §10.2 + §10.4 |
+| Campo dB en el payload | `nivel_db` | `nivel_db` (§3.1) | 🔴 | ✅ cerrado en §10.4 punto 6 |
+| `timestamp_medicion` | ISO 8601 UTC vía NTP (`configTime`) | ISO 8601 UTC (§3.1, §6.2) | 🔴 | ✅ cerrado en §10.4 punto 4 |
+| Campos extra en payload | ninguno (solo `nivel_db` + `timestamp_medicion`) | solo esos dos (§3.1) | 🟡 | ✅ cerrado en §10.4 punto 6 |
+| QoS | 0 (default `PubSubClient`) | 1 (§1, I5) | 🟡 | ⏳ abierto — `PubSubClient` no soporta QoS 1; idempotencia por UNIQUE cubre duplicados (§10.4 Opción A) |
+| TLS | `setInsecure()` (sin verificación de cert) | TLS con verificación (§1, I9) | 🟡 | ⏳ abierto — deuda técnica documentada, aceptable para MVP |
+| Frecuencia | 5s fijo | 10s base, ráfaga 2s al superar 80 dB (§4) | 🟢 | ✅ aceptable para 1 sensor |
+| Auth MQTT | credencial compartida (`40db-sensor`) para publish + `backend-subscriber` dedicado para subscribe | per-sensor recomendado (§5.1), shared MVP (§5.2) | 🟢 | ✅ cerrado en §10.3 con modelo híbrido (I8 actualizada) |
+| **Fuente de la lectura** | random walk simulado (módulo KY-038 dañado) | micrófono físico real | 🟡 | ⏳ abierto — reemplazar módulo (MAX4466 recomendado); cero cambios al firmware al hacerlo, solo restaurar `measureAmplitude()` |
 
 **Decisión sobre `sensor_id` (cierra una 🤝).** El topic usa **el UUID de `public.sensor.id`** (canónico, lowercase, con guiones). No usamos slugs humanos como `UE-MAI-0001`: el slug es útil para humanos pero no es PK ni se garantiza único contra renombramientos. El UUID es estable y matchea la FK que `lectura.sensor_id` necesita. Si el equipo IoT prefiere un slug en el firmware por legibilidad de logs, lo agregamos como **columna extra `codigo` en `sensor`** y el firmware sigue usando UUID en el topic.
 
@@ -50,7 +53,7 @@ Snapshot del `.ino` actual contra lo que este documento exige. Cada fila bloquea
 | I2 | **El backend es subscriber, los sensores son publishers** | 🔒 | Patrón pub/sub estándar; backend no inicia conexión a sensores. |
 | I3 | **Cada sensor publica en su propio topic**: `40db/sensores/{sensor_id}/lectura` | 🔒 | `{sensor_id}` = UUID de `public.sensor.id` (canónico, lowercase, con guiones). Topic per-sensor permite suscripciones granulares en debug y ACLs por wildcard. Cerrado en §0. |
 | I4 | **Payload JSON** con campos: `nivel_db` (numeric), `timestamp_medicion` (ISO 8601 UTC) | 🔒 | JSON > binario para prototipo (debuggable). Si el volumen escala (ver §4 y `bbdd.md` §3.5), evaluar MessagePack o Protobuf. Cerrado en §0. |
-| I5 | **QoS 1 (at-least-once)** | 🔒 | Para sensores ambientales, perder lecturas ocasionales es tolerable, pero QoS 1 con idempotencia (I7) da una garantía razonable sin la complejidad de QoS 2. El firmware actual usa QoS 0 — debe subir a 1. |
+| I5 | **QoS 1 (at-least-once)** nominal; MVP corre QoS 0 por restricción de librería | 🔒 (target) / ⏳ (MVP) | `PubSubClient` (lib actual del firmware) **no soporta QoS 1 en publish**. Para MVP se acepta QoS 0 — la UNIQUE `(sensor_id, timestamp_medicion)` absorbe duplicados (I7), y lo que se pierde son sólo lecturas que el cliente cree haber publicado y el broker no recibió. Aceptable para 1 sensor de testing. Migrar a `AsyncMqttClient`/`PicoMQTT` queda como roadmap; ver §10.4 Opción A vs B. |
 | I6 | **No retain** flag en mensajes | 🔒 | Lecturas son time-series, no estado. Un suscriptor nuevo no debería recibir la "última lectura" como si fuera actual. |
 | I7 | **Idempotencia: `(sensor_id, timestamp_medicion)` es UNIQUE en `lectura`** | 🔒 | QoS 1 puede duplicar. La UNIQUE constraint absorbe duplicados sin error. Sigue siendo válida tras particionamiento (`bbdd.md` §3.5). |
 | I8 | **Autenticación HiveMQ híbrida MVP: backend dedicado + publisher compartido** | 🔒 (MVP) / 🤝 (escala) | El backend usa `backend-subscriber` con ACL `SUBSCRIBE 40db/#` (solo lee). Los sensores comparten un único user `40db-sensor` con ACL `PUBLISH 40db/sensores/+/lectura` mientras haya 1 sensor en MVP. Cuando entren más sensores, migrar a credenciales por-sensor (§5.1) — sigue 🤝 para esa fase. Cerrado para MVP en §10. |

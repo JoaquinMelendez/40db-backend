@@ -23,6 +23,7 @@ El backend de 40dB resuelve un sistema **híbrido transaccional + telemetría en
 3. **Agregación para heatmap.** El volumen de `lectura` crece rápido; el frontend no puede recibir millones de puntos. Backend agrega/promedia por área y bucket temporal antes de enviar.
 4. **Volumen de time-series.** Con 30 sensores publicando cada 5–10s, `lectura` crece ~95–190M rows/año (ver `iot.md` §4). Se diseña para escalar desde el día 1: particionamiento nativo por mes (ADR 08), índices alineados con el patrón de query (sensor + tiempo) y agregación en SQL, no en Python.
 5. **Múltiples actores de entrada/salida.** HTTP (cliente web), MQTT (sensores), Postgres (persistencia + RPC). El acoplamiento entre ellos debe ser explícito y testeable.
+6. **Autorización multi-rol con scope variable.** Tres roles (`ciudadano` / `municipalidad` / `admin`) con reglas distintas: ciudadano sobre lo propio, municipalidad scoped a su comuna, admin cross-comuna sin filtro. La autorización vive en use cases (capa `application/`) y se inyecta vía dependencies de FastAPI — ningún endpoint hace `if role == "admin"` ad-hoc. Detalle en `auth.md` §6.
 
 ---
 
@@ -340,3 +341,11 @@ Cambios postergados pero documentados:
 - **Vista materializada** para heatmap si performance lo exige. Ver [`bbdd.md` §10.4](./bbdd.md).
 - **Automatización de particiones** (`pg_partman` + política de retención). El particionamiento en sí ya es parte del MVP (ADR 08); lo que queda es automatizar la creación de futuras particiones y definir cuándo se hace drop de las antiguas. Ver [`bbdd.md` §10.3](./bbdd.md).
 - **Salida de Supabase a Postgres + TimescaleDB self-hosted** si el feedback de hipertablas se vuelve no-negociable. Plan de salida: portar el schema actual (todo el SQL es estándar Postgres salvo la integración con `auth.users`), reemplazar Supabase Auth por uno propio (Authlib + JWT manual), exponer un panel admin custom. Es un movimiento grande — solo se hace si el volumen real supera lo que partición nativa + buenos índices pueden manejar (>500M rows/año o latencias de heatmap >1s).
+- **Categoría en reportes** (`reporte.categoria`). Pedido por frontend (`integracion-backend/02-endpoints-faltantes-back.md §4`). Trivial cuando se decida — `ALTER TABLE reporte ADD COLUMN categoria text CHECK (...)` + campo opcional en `POST /reportes`.
+- **Alertas sostenidas en heatmap** (`GET /heatmaps/alertas-sostenidas`). Pedido por frontend §5. Detecta zonas con `nivel_db > umbral` por `>= duracion_min`. Hoy el frontend deriva la métrica client-side aproximada.
+- **Reportes agregados para admin** (`GET /reportes/agregado`). Pedido por frontend §8. Export CSV/PDF de reportes group_by estado/comuna/día. No bloqueante.
+- **Historial de conectividad de sensores** (`GET /sensores/{id}/conectividad`). Pedido por frontend §9. Requiere persistir transiciones de `estado_salud` — descartado para MVP (D10 computa on-demand sin historial). Si se quiere, agregar tabla `historial_estado_sensor` + worker que detecte transiciones.
+- **Polígonos de comuna en Postgres** (función `comuna_by_point(lat, lng)`). Reemplazaría la resolución Nominatim client-side (`api.md §4.5.1`). Se evalúa si Nominatim da problemas reales en producción.
+- **Auditoría de promociones** (tabla `historial_promocion`). Documentada como roadmap en `auth.md` §8.4.
+- **`bbox` por comuna en `GET /comunas`** (pedido por frontend §10). Cosmético — el frontend mantiene mapa hardcodeado por ahora.
+- **Avatar de usuario** (`avatar_url` en `usuarios/me` + upload via Supabase Storage). Cosmético.
