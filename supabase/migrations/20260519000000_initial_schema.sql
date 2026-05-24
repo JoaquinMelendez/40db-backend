@@ -462,7 +462,7 @@ END;
 $$;
 
 -- 9.5 Sensores con estado_salud derivado on-demand (bbdd.md §5.5 / D10)
--- Umbrales: online ≤10min, intermitente ≤20min, offline >20min o !activo,
+-- Umbrales: online ≤1min, intermitente ≤5min, offline >5min o !activo,
 -- sin_lecturas si MAX(timestamp_medicion) IS NULL.
 CREATE OR REPLACE FUNCTION public.sensores_con_salud(
   p_comuna_id int DEFAULT NULL
@@ -502,8 +502,8 @@ BEGIN
     CASE
       WHEN NOT s.activo THEN 'offline'
       WHEN u.ts IS NULL THEN 'sin_lecturas'
-      WHEN u.ts >= now() - interval '10 minutes' THEN 'online'
-      WHEN u.ts >= now() - interval '20 minutes' THEN 'intermitente'
+      WHEN u.ts >= now() - interval '1 minute'  THEN 'online'
+      WHEN u.ts >= now() - interval '5 minutes' THEN 'intermitente'
       ELSE 'offline'
     END::text AS estado_salud,
     s.created_at
