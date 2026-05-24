@@ -90,6 +90,10 @@ Mapeo completo y subtipos en [`errores.md`](./errores.md) §3 y §10.
 | `GET` | `/api/v1/usuarios` | ✅ | admin | Listar usuarios (filtrable por tipo, comuna) |
 | `PATCH` | `/api/v1/usuarios/{id}/activo` | ✅ | admin | Activar/desactivar usuario |
 | `PATCH` | `/api/v1/usuarios/{id}/promover` | ✅ | admin | Cambiar `tipo` (y `comuna_id` si aplica) |
+| `POST` | `/api/v1/reportes-admin/archivos` | ✅ | admin | Subir PDF/CSV/imagen generado en el panel admin |
+| `GET` | `/api/v1/reportes-admin/archivos` | ✅ | admin | Listar archivos (filtrable por `tipo`, `generado_por_id`) |
+| `GET` | `/api/v1/reportes-admin/archivos/{id}/descarga` | ✅ | admin | Signed URL temporal para descargar el archivo |
+| `DELETE` | `/api/v1/reportes-admin/archivos/{id}` | ✅ | admin | Eliminar archivo (blob + metadata) |
 
 > **Auth flow (signup/login)** vive en Supabase Auth, **no en este backend**. Ver [`auth.md`](./auth.md) §4.
 
@@ -856,10 +860,148 @@ Content-Type: application/json
 
 ---
 
+### 4.23 `POST /api/v1/reportes-admin/archivos`
+
+Subir un archivo (PDF, CSV o imagen) generado desde la vista `/admin-dashboard/reportes`. El backend guarda el blob en el bucket privado `reportes-admin` de Supabase Storage y registra la metadata en `reporte_archivo_admin`.
+
+```http
+POST /api/v1/reportes-admin/archivos
+Authorization: Bearer <jwt-admin>
+Content-Type: multipart/form-data
+```
+
+**Body (multipart):**
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `archivo` | file | ✅ | El binario. `Content-Type` debe coincidir con `tipo`. |
+| `nombre` | `string` | ✅ | Nombre legible para mostrar al usuario (1–200 chars). |
+| `tipo` | `string` | ✅ | `pdf` / `csv` / `imagen`. |
+| `rango_desde` | ISO 8601 | — | Inicio del período cubierto por el reporte. |
+| `rango_hasta` | ISO 8601 | — | Fin del período. Debe ser ≥ `rango_desde`. |
+
+**MIME types aceptados:**
+
+- `tipo=pdf`: `application/pdf`
+- `tipo=csv`: `text/csv`, `application/csv`, `application/vnd.ms-excel`
+- `tipo=imagen`: `image/png`, `image/jpeg`, `image/webp`
+
+**Tamaño máximo:** `ARCHIVO_MAX_SIZE_MB` (default 20 MB).
+
+**Auth:** `current_user_admin`.
+
+**Response 201:**
+
+```json
+{
+  "id": "uuid",
+  "nombre": "reporte-mayo-2026.pdf",
+  "tipo": "pdf",
+  "mime_type": "application/pdf",
+  "tamano_bytes": 184320,
+  "generado_por_id": "uuid",
+  "generado_por_nombre": "Admin Demo",
+  "rango_desde": "2026-05-01T00:00:00Z",
+  "rango_hasta": "2026-05-31T23:59:59Z",
+  "created_at": "2026-05-24T18:00:00Z"
+}
+```
+
+**Errores:** 401, 403, 422 (`validation_error` si mime no matchea `tipo`, archivo vacío, o tamaño > límite), 503 (`external_service_error` si Storage o la metadata fallan).
+
+---
+
+### 4.24 `GET /api/v1/reportes-admin/archivos`
+
+Listar archivos previamente subidos. Paginación cursor (mismo esquema que `/usuarios`).
+
+```http
+GET /api/v1/reportes-admin/archivos
+  ?tipo=pdf
+  &generado_por_id=<uuid>
+  &limit=20
+  &cursor=
+Authorization: Bearer <jwt-admin>
+```
+
+**Query params:**
+
+| Param | Tipo | Default | Notas |
+|---|---|---|---|
+| `tipo` | `string` | — | Filtra por `pdf` / `csv` / `imagen`. |
+| `generado_por_id` | `uuid` | — | Filtra por autor. |
+| `limit` | `int` | 20 | 1–100. |
+| `cursor` | `string` | — | Cursor opaco de la página anterior. |
+
+**Response 200:**
+
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "nombre": "reporte-mayo-2026.pdf",
+      "tipo": "pdf",
+      "mime_type": "application/pdf",
+      "tamano_bytes": 184320,
+      "generado_por_id": "uuid",
+      "generado_por_nombre": "Admin Demo",
+      "rango_desde": "2026-05-01T00:00:00Z",
+      "rango_hasta": "2026-05-31T23:59:59Z",
+      "created_at": "2026-05-24T18:00:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+**Errores:** 401, 403.
+
+---
+
+### 4.25 `GET /api/v1/reportes-admin/archivos/{id}/descarga`
+
+Devuelve una signed URL de corta duración apuntando directamente al objeto en Supabase Storage. El frontend hace `GET` (o `<a download>`) contra esa URL — el backend **no** hace proxy del binario.
+
+```http
+GET /api/v1/reportes-admin/archivos/{id}/descarga
+Authorization: Bearer <jwt-admin>
+```
+
+**Response 200:**
+
+```json
+{
+  "url": "https://<proj>.supabase.co/storage/v1/object/sign/reportes-admin/...?token=...",
+  "expires_in_seconds": 300
+}
+```
+
+`expires_in_seconds` se controla con el env `STORAGE_SIGNED_URL_TTL_SECONDS` (default 300).
+
+**Errores:** 401, 403, 404 (`not_found`), 503 si Storage está caído.
+
+---
+
+### 4.26 `DELETE /api/v1/reportes-admin/archivos/{id}`
+
+Borra el blob del bucket y luego la fila de metadata. Si el blob no existe el backend ignora el error (compensación). Si la metadata falla tras borrar el blob, queda un huérfano *en la base* — la operación inversa al upload.
+
+```http
+DELETE /api/v1/reportes-admin/archivos/{id}
+Authorization: Bearer <jwt-admin>
+```
+
+**Response 204:** sin body.
+
+**Errores:** 401, 403, 404, 503.
+
+---
+
 ## 5. CORS
 
 - **Origenes permitidos:** lista blanca configurable vía env `CORS_ORIGINS` (CSV de URLs). En dev, suele incluir `http://localhost:5173` (Vite del frontend Vue).
-- **Métodos permitidos:** `GET`, `POST`, `PATCH`, `OPTIONS`.
+- **Métodos permitidos:** `GET`, `POST`, `PATCH`, `DELETE`, `OPTIONS`.
 - **Headers permitidos:** `Authorization`, `Content-Type`, `X-Correlation-Id`, `Idempotency-Key`.
 - **Credentials:** `false`. Los JWT se envían explícitamente, no en cookies.
 
