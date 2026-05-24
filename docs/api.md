@@ -81,6 +81,15 @@ Mapeo completo y subtipos en [`errores.md`](./errores.md) §3 y §10.
 | `GET` | `/api/v1/usuarios/me` | ✅ | el propio | Perfil propio |
 | `GET` | `/api/v1/comunas` | ❌ | público | Catálogo de comunas (dropdown del frontend) |
 | `GET` | `/api/v1/tipos-estado` | ❌ | público | Catálogo de estados (dropdown) |
+| `GET` | `/api/v1/sensores` | ✅ | municipalidad (su comuna) o admin (todas) | Listar sensores con `estado_salud` derivado |
+| `GET` | `/api/v1/sensores/{id}` | ✅ | municipalidad (de la comuna) o admin | Detalle de un sensor con `estado_salud` |
+| `GET` | `/api/v1/sensores/resumen` | ✅ | municipalidad (su comuna) o admin | KPIs de salud (`online`/`intermitente`/`offline`/`sin_lecturas`) |
+| `POST` | `/api/v1/sensores` | ✅ | admin | Crear sensor (provisioning) |
+| `PATCH` | `/api/v1/sensores/{id}` | ✅ | admin | Editar nombre/coordenadas |
+| `DELETE` | `/api/v1/sensores/{id}` | ✅ | admin | Soft-delete (`activo = false`) |
+| `GET` | `/api/v1/usuarios` | ✅ | admin | Listar usuarios (filtrable por tipo, comuna) |
+| `PATCH` | `/api/v1/usuarios/{id}/activo` | ✅ | admin | Activar/desactivar usuario |
+| `PATCH` | `/api/v1/usuarios/{id}/promover` | ✅ | admin | Cambiar `tipo` (y `comuna_id` si aplica) |
 
 > **Auth flow (signup/login)** vive en Supabase Auth, **no en este backend**. Ver [`auth.md`](./auth.md) §4.
 
@@ -240,6 +249,7 @@ Content-Type: application/json
   "descripcion": "Música muy alta desde las 23:00",
   "latitud": -33.4372,
   "longitud": -70.6483,
+  "comuna_id": 13,
   "lectura_evidencia_id": 4821
 }
 ```
@@ -250,9 +260,49 @@ Content-Type: application/json
 | `descripcion` | `string` (10–2000) | ✅ | — |
 | `latitud` | `float` (-90..90) | ✅ | — |
 | `longitud` | `float` (-180..180) | ✅ | — |
+| `comuna_id` | `int` | — | Si viene, debe existir en `comuna`. Si se omite, el server usa `usuario.comuna_id` como fallback. Ver §4.5.1 para el contrato cliente-side de resolución. |
 | `lectura_evidencia_id` | `int` | — | Si vino del preview (`/buscar-evidencia`). Si se omite, el server intenta auto-adjuntar como fallback. |
 
 **Lógica del server:** invoca la RPC compuesta `crear_reporte_con_validacion`. Detalle en [`backend.md`](./backend.md) §5.1 y [`bbdd.md`](./bbdd.md) §5.2.
+
+#### 4.5.1 Resolución de `comuna_id` del lado cliente (contrato esperado)
+
+El backend no carga polígonos comunales (sería ~3 horas de data work + riesgo de bugs geo). En su lugar, **delega al cliente** la responsabilidad de resolver `comuna_id` desde lat/lng. Esto es viable porque el frontend ya integra Leaflet + reverse-geocode (decisión F4 en `40db-frontend/docs/integracion-backend/README.md`).
+
+**Pipeline esperado del cliente (frontend Vue 3):**
+
+1. Usuario marca punto en el map picker → obtiene `lat, lng`.
+2. Frontend llama a Nominatim (API pública de OpenStreetMap):
+   ```
+   GET https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lng}&format=jsonv2&accept-language=es
+   ```
+   Headers recomendados: `User-Agent: 40db-frontend/1.0 (contact@example.com)` (Nominatim exige UA identificable; rate limit 1 req/s — alcanza para reportes esporádicos).
+3. Del response, extraer el nombre de comuna probando claves en este orden:
+   - `address.county` (Chile suele venir acá: "Maipú", "Providencia").
+   - `address.city_district` (fallback).
+   - `address.suburb` o `address.town` (último recurso).
+4. Normalizar (lowercase, sin tildes) y matchear contra `GET /api/v1/comunas` (catálogo cacheado en el front al boot).
+5. Si match → enviar `comuna_id` resuelto en el body del `POST /reportes`.
+6. Si no match (comuna no existe en el catálogo, o Nominatim no devuelve nada, o falla la red) → **no enviar `comuna_id`** y dejar que el backend use el fallback (`usuario.comuna_id`).
+
+**Comportamiento del backend según viene o no `comuna_id`:**
+
+| Caso | Acción del backend |
+|---|---|
+| `comuna_id` viene y existe en `comuna` | Se usa ese. Caso normal. |
+| `comuna_id` viene pero no existe | 422 `validation_error` con mensaje "comuna_id no existe". |
+| `comuna_id` omitido y `usuario.comuna_id` no es null | Se usa el del usuario. Comportamiento legacy. |
+| `comuna_id` omitido y `usuario.comuna_id` es null (sin onboarding) | 422 `validation_error` con mensaje "Falta completar onboarding (comuna_id) o enviar comuna_id en el body". |
+
+**Por qué no validamos `comuna_id` contra `(lat, lng)`:** sería redundante con la responsabilidad del cliente y obligaría a cargar polígonos en el backend. Si el cliente envía un `comuna_id` que no corresponde geográficamente, se acepta — el modelo de confianza es que el frontend ya hizo el match correcto.
+
+**Riesgos asumidos:**
+
+- **Nominatim down o lento** → fallback funciona (usa `usuario.comuna_id`), pero pierde precisión cross-comuna.
+- **Rate limit de Nominatim** (1 req/s, sin key) → para reportes individuales no es problema. Si en el futuro hay flujos batch, considerar hostear Nominatim propio o pasar a Mapbox/Google.
+- **Comuna inexistente en catálogo** → ej. usuario reporta desde una comuna no seedeada. El front no enviará `comuna_id`, fallback a `usuario.comuna_id`. Documentar: el catálogo `comuna` debe mantenerse al día.
+
+**Roadmap:** si el modelo cliente-side genera friction (UX confusa, errores de matching), evaluar opción 2 del análisis original (polígonos del INE cargados en Postgres con función `comuna_by_point(lat, lng)`).
 
 **Response 201:**
 ```json
@@ -489,6 +539,320 @@ GET /api/v1/tipos-estado
   { "id": 4, "nombre": "Descartado", "descripcion": "Reporte invalido o duplicado", "orden": 4 }
 ]
 ```
+
+---
+
+### 4.14 `GET /api/v1/sensores`
+
+Listar sensores con `estado_salud` derivado on-demand (D10 en `bbdd.md`). Para `municipalidad`, filtra automáticamente por `usuario.comuna_id`. Para `admin`, lista todos o por `comuna_id` query.
+
+```http
+GET /api/v1/sensores?comuna_id=13&estado_salud=online&activo=true&limit=20&cursor=
+Authorization: Bearer <jwt>
+```
+
+**Query params:**
+
+| Param | Tipo | Notas |
+|---|---|---|
+| `comuna_id` | `int` | Solo aplicable para `admin` (`municipalidad` lo ignora y usa el suyo). Si no viene y el caller es admin → todas las comunas. |
+| `estado_salud` | `string` | Filtra por `online` / `intermitente` / `offline` / `sin_lecturas`. |
+| `activo` | `bool` | Filtro adicional sobre `sensor.activo`. Default: sin filtrar. |
+| `limit`, `cursor` | — | Paginación cursor (mismo encoding que `/reportes/mios`). |
+
+**Auth:** `current_user_municipal_o_admin`. Si caller no es ninguno → 403. Si caller es `municipalidad` y manda `comuna_id` distinto al suyo → se ignora (no se devuelve 403; el filtro de su comuna manda).
+
+**Response 200:**
+```json
+{
+  "data": [
+    {
+      "id": "d26bc4d1-3684-4fef-9953-00596b7d9ee8",
+      "nombre": "Villa El Abrazo - Maipu",
+      "comuna_id": 4,
+      "comuna_nombre": "Maipú",
+      "latitud": -33.5180,
+      "longitud": -70.7580,
+      "activo": true,
+      "estado_salud": "online",
+      "ultima_lectura_at": "2026-05-23T02:36:14Z",
+      "ultima_lectura_db": 55.7
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+Si un sensor nunca recibió lecturas: `ultima_lectura_at` y `ultima_lectura_db` son `null`, `estado_salud` es `sin_lecturas`.
+
+**Errores:** 401, 403.
+
+---
+
+### 4.15 `GET /api/v1/sensores/{id}`
+
+Detalle de un sensor individual con `estado_salud`.
+
+```http
+GET /api/v1/sensores/d26bc4d1-3684-4fef-9953-00596b7d9ee8
+Authorization: Bearer <jwt>
+```
+
+**Auth:** `current_user_municipal_o_admin`. Si el caller es `municipalidad` y el sensor pertenece a otra comuna → 403 `comuna_mismatch`.
+
+**Response 200:** mismo shape de un item de §4.14 pero envuelto sin `data`:
+
+```json
+{
+  "id": "d26bc4d1-...",
+  "nombre": "Villa El Abrazo - Maipu",
+  "comuna_id": 4,
+  "comuna_nombre": "Maipú",
+  "latitud": -33.5180,
+  "longitud": -70.7580,
+  "activo": true,
+  "estado_salud": "online",
+  "ultima_lectura_at": "2026-05-23T02:36:14Z",
+  "ultima_lectura_db": 55.7,
+  "created_at": "2026-05-23T01:15:00Z"
+}
+```
+
+**Errores:** 401, 403, 404 (`sensor_not_found`).
+
+---
+
+### 4.16 `GET /api/v1/sensores/resumen`
+
+KPIs de salud agregados. Para municipalidad: contadores de su comuna. Para admin: globales (o por `comuna_id` si viene).
+
+```http
+GET /api/v1/sensores/resumen?comuna_id=4
+Authorization: Bearer <jwt>
+```
+
+**Auth:** `current_user_municipal_o_admin`.
+
+**Response 200:**
+```json
+{
+  "total": 12,
+  "online": 8,
+  "intermitente": 2,
+  "offline": 1,
+  "sin_lecturas": 1,
+  "calculado_at": "2026-05-23T02:38:00Z"
+}
+```
+
+`calculado_at` es el `now()` del servidor — el front lo puede mostrar como "datos actualizados hace X segundos".
+
+**Errores:** 401, 403.
+
+---
+
+### 4.17 `POST /api/v1/sensores`
+
+Crear un sensor (provisioning). Reemplaza el flow manual de SQL editor.
+
+```http
+POST /api/v1/sensores
+Authorization: Bearer <jwt-admin>
+Content-Type: application/json
+```
+
+**Body:**
+```json
+{
+  "nombre": "Plaza Italia - Norte",
+  "comuna_id": 2,
+  "latitud": -33.4372,
+  "longitud": -70.6483
+}
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `nombre` | `string` (3–120) | ✅ | Único — UNIQUE en DB. |
+| `comuna_id` | `int` | ✅ | Debe existir en `comuna`. |
+| `latitud` | `float` (-90..90) | ✅ | — |
+| `longitud` | `float` (-180..180) | ✅ | — |
+
+**Auth:** `current_user_admin`.
+
+**Response 201:** el sensor recién creado, mismo shape que §4.15. `activo=true`, `estado_salud='sin_lecturas'`, `ultima_lectura_at=null`.
+
+**Side effects:**
+- `id` se genera (UUID v4 vía `gen_random_uuid()`).
+- `ubicacion` (geography) se genera automáticamente por el `GENERATED ALWAYS AS`.
+- El UUID generado **debe** copiarse al firmware del ESP32 que va a publicar a `40db/sensores/{id}/lectura` (ver `iot.md` §10.4).
+
+**Errores:**
+- 401, 403.
+- 422 si `nombre` duplicado (`sensor_nombre_already_exists`), `comuna_id` no existe, o coords fuera de rango.
+
+---
+
+### 4.18 `PATCH /api/v1/sensores/{id}`
+
+Editar nombre o coordenadas. **No se puede cambiar `comuna_id`** (un sensor pertenece a la comuna donde fue instalado físicamente; mover sensor = darlo de baja y crear uno nuevo).
+
+```http
+PATCH /api/v1/sensores/d26bc4d1-...
+Authorization: Bearer <jwt-admin>
+Content-Type: application/json
+```
+
+**Body (todos opcionales, al menos uno requerido):**
+```json
+{
+  "nombre": "Villa El Abrazo - Maipú (recalibrado)",
+  "latitud": -33.5181,
+  "longitud": -70.7581,
+  "activo": false
+}
+```
+
+**Auth:** `current_user_admin`.
+
+**Response 200:** sensor actualizado.
+
+**Errores:** 401, 403, 404, 422.
+
+---
+
+### 4.19 `DELETE /api/v1/sensores/{id}`
+
+Soft-delete. Setea `activo=false` y mantiene las lecturas históricas (alimentan heatmap).
+
+```http
+DELETE /api/v1/sensores/d26bc4d1-...
+Authorization: Bearer <jwt-admin>
+```
+
+**Auth:** `current_user_admin`.
+
+**Response 200:**
+```json
+{
+  "id": "d26bc4d1-...",
+  "activo": false,
+  "estado_salud": "offline"
+}
+```
+
+**Side effects:**
+- `validar_reporte_ruido` (`bbdd.md` §5.1) filtra por `sensor.activo = true`, así que un sensor con `activo=false` deja de generar evidencia para reportes nuevos.
+- Las lecturas existentes siguen apareciendo en el heatmap.
+
+**No hay hard-delete** en API. Si por alguna razón se requiere borrar físicamente (caso GDPR, falla de aprovisionamiento), hacerlo via SQL editor con cuidado de la FK compuesta `reporte.lectura_evidencia_*` → `lectura(id, timestamp_medicion)`.
+
+**Errores:** 401, 403, 404.
+
+---
+
+### 4.20 `GET /api/v1/usuarios`
+
+Listar usuarios. Solo admin.
+
+```http
+GET /api/v1/usuarios?tipo=municipalidad&comuna_id=13&activo=true&limit=20&cursor=
+Authorization: Bearer <jwt-admin>
+```
+
+**Query params:**
+
+| Param | Tipo | Notas |
+|---|---|---|
+| `tipo` | `string` | Filtra por `ciudadano` / `municipalidad` / `admin`. |
+| `comuna_id` | `int` | Filtra por comuna del usuario. |
+| `activo` | `bool` | Filtra por `usuario.activo`. |
+| `q` | `string` | Búsqueda por `nombre` o `email` (ILIKE). Opcional. |
+| `limit`, `cursor` | — | Paginación cursor. |
+
+**Auth:** `current_user_admin`.
+
+**Response 200:**
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "nombre": "Joaquín Meléndez",
+      "email": "joaquin@example.com",
+      "telefono": "+56912345678",
+      "tipo": "ciudadano",
+      "comuna_id": 4,
+      "comuna_nombre": "Maipú",
+      "activo": true,
+      "created_at": "2026-05-15T18:30:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+**Nota sobre `email`:** vive en `auth.users.email` (no en `public.usuario`). El backend hace JOIN al armar la respuesta para que el panel admin lo muestre.
+
+**Errores:** 401, 403.
+
+---
+
+### 4.21 `PATCH /api/v1/usuarios/{id}/activo`
+
+Activar o desactivar un usuario (soft-disable). Un usuario inactivo no puede autenticarse (401 en `current_user`).
+
+```http
+PATCH /api/v1/usuarios/c1b8a700-.../activo
+Authorization: Bearer <jwt-admin>
+Content-Type: application/json
+```
+
+**Body:**
+```json
+{ "activo": false }
+```
+
+**Auth:** `current_user_admin`. **El admin no puede desactivarse a sí mismo** (`id == current_user.id`) → 422.
+
+**Response 200:** usuario completo (mismo shape que `GET /usuarios/{id}.data[]`).
+
+**Errores:** 401, 403, 404, 422.
+
+---
+
+### 4.22 `PATCH /api/v1/usuarios/{id}/promover`
+
+Cambiar el rol y/o comuna de un usuario. Reglas detalladas en [`auth.md`](./auth.md) §8.2.
+
+```http
+PATCH /api/v1/usuarios/c1b8a700-.../promover
+Authorization: Bearer <jwt-admin>
+Content-Type: application/json
+```
+
+**Body:**
+```json
+{
+  "nuevo_tipo": "municipalidad",
+  "comuna_id": 13
+}
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `nuevo_tipo` | `string` | ✅ | `ciudadano` / `municipalidad` / `admin`. |
+| `comuna_id` | `int` | Obligatorio si `nuevo_tipo='municipalidad'` | Debe existir. Para `admin` es opcional (afinidad informativa). Para `ciudadano` se ignora (preserva la actual). |
+
+**Auth:** `current_user_admin`. **El admin no puede degradarse a sí mismo** (`id == current_user.id`) → 422 `cannot_demote_self`.
+
+**Response 200:** usuario actualizado.
+
+**Errores:**
+- 401, 403, 404.
+- 422 `comuna_id_required` si `nuevo_tipo='municipalidad'` y no viene `comuna_id`.
+- 422 `comuna_not_found` si el `comuna_id` no existe.
+- 422 `cannot_demote_self` si `id == current_user.id`.
 
 ---
 

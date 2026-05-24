@@ -18,7 +18,7 @@ Documento de **identidad, sesiones y autorización** del backend 40dB. Cubre có
 | A3 | **JWT verificado localmente** en FastAPI, no via roundtrip a Supabase | El JWT firmado por Supabase Auth se valida con la clave compartida sin red. Es lo que recomienda Supabase para backends propios. |
 | A4 | **Frontend habla con Supabase Auth directo** para signup/login; con FastAPI para todo lo demás | Reduce código en backend. FastAPI recibe el JWT como `Bearer` y lo valida. |
 | A5 | **Backend usa siempre `service_role_key`** para hablar con Supabase (bypassa RLS) | Toda autorización vive en use cases (capa `application/`), no en políticas RLS. Ver [`backend.md` ADR 07](./backend.md). |
-| A6 | **Promoción a `tipo='municipalidad'` es manual** (SQL editor con service_role) | Endpoint dedicado agregaría rol "admin" sin caso de uso real en MVP. Funcionarios son pocos y se asignan al inicio del piloto. |
+| A6 | **Promoción es vía endpoint protegido por rol `admin`** (`PATCH /usuarios/{id}/promover`). La promoción manual via SQL queda solo como **bootstrap del primer admin** | Tras agregar el rol `admin` (D9 en `bbdd.md`), el flujo de promoción se mueve a un endpoint auditable. El primer admin se crea por SQL una sola vez (no hay otro camino: nadie puede llamar el endpoint sin ser admin). Detalle en §8. |
 | A7 | **Heatmap es público** (sin auth); reportes y panel municipal requieren JWT | Cualquier vecino debe poder ver ruido en su zona sin barrera. La acción de reportar/atender sí requiere identidad. |
 
 ---
@@ -37,7 +37,7 @@ public.usuario ────┘
    ├── id           uuid          (= auth.users.id)
    ├── nombre       text
    ├── telefono     text          (opcional)
-   ├── tipo         text          ('ciudadano' | 'municipalidad')
+   ├── tipo         text          ('ciudadano' | 'municipalidad' | 'admin')
    ├── comuna_id    int → comuna  (NULL hasta onboarding)
    ├── activo       boolean
    └── created_at, updated_at
@@ -184,27 +184,46 @@ async def current_user(creds=Depends(bearer)) -> Usuario:
 | `current_user` | JWT válido + perfil existente y activo | Endpoints autenticados básicos |
 | `current_user_municipal` | `current_user` + `tipo='municipalidad'` | Panel de funcionarios |
 | `current_user_municipal_de_comuna(comuna_id)` | + funcionario debe pertenecer a la comuna del recurso | Acciones sobre reportes de una comuna específica |
+| `current_user_admin` | `current_user` + `tipo='admin'` | Panel admin (CRUD de sensores, promoción de usuarios, listado cross-comuna) |
+| `current_user_municipal_o_admin` | `current_user` + `tipo IN ('municipalidad', 'admin')` | Endpoints que ambos roles pueden invocar (ej. `GET /sensores` filtrado por comuna del funcionario, sin filtro para admin) |
 
 Los detalles de qué excepción lanzar y cómo mapearla a HTTP están en `errores.md`.
+
+**Nota sobre el rol admin y el filtro de comuna:** las dependencies de comuna (`current_user_municipal_de_comuna`) **no aplican a admin** — el admin es cross-comuna. Cuando un endpoint usa `current_user_municipal_o_admin` y el `usuario.tipo` resulta `admin`, se omite el filtro de comuna en el query (ver lógica concreta en cada endpoint de `api.md`).
 
 ---
 
 ## 6. Autorización (matriz de roles)
 
-| Acción | Anónimo | `ciudadano` | `municipalidad` |
-|---|---|---|---|
-| `GET /heatmaps` | ✅ | ✅ | ✅ |
-| `GET /health/*` | ✅ | ✅ | ✅ |
-| `POST /auth/signup` (via Supabase) | ✅ | — | — |
-| `POST /auth/login` (via Supabase) | ✅ | — | — |
-| `POST /reportes` | ❌ | ✅ | ✅ |
-| `GET /reportes/mios` | ❌ | ✅ | ✅ |
-| `GET /reportes/comuna/{id}` | ❌ | ❌ | ✅ solo si `usuario.comuna_id = id` |
-| `PATCH /reportes/{id}/estado` | ❌ | ❌ | ✅ solo si reporte.comuna_id = usuario.comuna_id |
-| `PATCH /usuarios/me` (onboarding) | ❌ | ✅ | ✅ |
-| `PATCH /usuarios/{id}/promover` | ❌ | ❌ | ❌ (solo SQL editor con service_role) |
+| Acción | Anónimo | `ciudadano` | `municipalidad` | `admin` |
+|---|---|---|---|---|
+| `GET /heatmaps` | ✅ | ✅ | ✅ | ✅ |
+| `GET /health/*` | ✅ | ✅ | ✅ | ✅ |
+| `GET /comunas`, `GET /tipos-estado` | ✅ | ✅ | ✅ | ✅ |
+| `POST /auth/signup` (via Supabase) | ✅ | — | — | — |
+| `POST /auth/login` (via Supabase) | ✅ | — | — | — |
+| `POST /reportes` | ❌ | ✅ | ✅ | ✅ |
+| `GET /reportes/buscar-evidencia` | ❌ | ✅ | ✅ | ✅ |
+| `GET /reportes/mios` | ❌ | ✅ | ✅ | ✅ |
+| `GET /reportes/{id}` | ❌ | ✅ (si dueño) | ✅ (si comuna match) | ✅ (cualquier reporte) |
+| `GET /reportes/comuna/{id}` | ❌ | ❌ | ✅ (si `usuario.comuna_id = id`) | ✅ (cualquier comuna) |
+| `PATCH /reportes/{id}/estado` | ❌ | ❌ | ✅ (si `reporte.comuna_id = usuario.comuna_id`) | ✅ (cualquier reporte) |
+| `GET /usuarios/me`, `PATCH /usuarios/me` | ❌ | ✅ | ✅ | ✅ |
+| `GET /sensores`, `GET /sensores/{id}` | ❌ | ❌ | ✅ (filtrado por su comuna) | ✅ (sin filtro) |
+| `GET /sensores/resumen` | ❌ | ❌ | ✅ (su comuna) | ✅ (global o por comuna) |
+| `POST /sensores` (crear) | ❌ | ❌ | ❌ | ✅ |
+| `PATCH /sensores/{id}` (editar) | ❌ | ❌ | ❌ | ✅ |
+| `DELETE /sensores/{id}` (soft) | ❌ | ❌ | ❌ | ✅ |
+| `GET /usuarios` (listado) | ❌ | ❌ | ❌ | ✅ |
+| `PATCH /usuarios/{id}/activo` | ❌ | ❌ | ❌ | ✅ |
+| `PATCH /usuarios/{id}/promover` | ❌ | ❌ | ❌ | ✅ |
 
-**Regla de la comuna:** un funcionario `municipalidad` solo actúa sobre reportes de **su propia** comuna. Esto se valida en la capa `application/` antes de cualquier mutación. No hay endpoint cross-comuna.
+**Reglas operacionales:**
+
+- **Regla de la comuna (rol `municipalidad`):** un funcionario solo actúa sobre reportes y sensores de **su propia** comuna. Validado en la capa `application/` antes de mutar.
+- **Bypass de la comuna (rol `admin`):** el admin es **cross-comuna** por diseño. Cuando un endpoint usa la dependency dual (`current_user_municipal_o_admin`), si el `tipo='admin'` se omite el filtro de comuna en el query.
+- **Admin no puede transicionarse a sí mismo a `ciudadano`** ni desactivarse a sí mismo. Validación en el use case para evitar dejar la plataforma sin admin (ver §8).
+- **Auto-acciones bloqueadas:** un admin no se puede degradar a sí mismo via `PATCH /usuarios/{id}/promover` con `id == current_user.id` (422). Esto evita el "soft lockout" donde un admin pierde permisos por error.
 
 ---
 
@@ -231,18 +250,52 @@ PATCH /api/v1/usuarios/me
 
 ---
 
-## 8. Promoción manual a `municipalidad`
+## 8. Promoción de usuarios
 
-Para piloto/demo, el admin del proyecto promueve usuarios desde el panel de Supabase (SQL editor con `service_role`):
+Tras D9, las promociones se hacen vía endpoint protegido `PATCH /api/v1/usuarios/{id}/promover` (`api.md` §4.20). El SQL manual queda solo como **bootstrap del primer admin** (problema del huevo y la gallina: no se puede llamar el endpoint sin ser admin).
+
+### 8.1 Bootstrap del primer admin (una sola vez)
+
+Manual via Supabase Dashboard → SQL Editor, con `service_role`:
 
 ```sql
 UPDATE public.usuario
-   SET tipo      = 'municipalidad',
-       comuna_id = (SELECT id FROM comuna WHERE nombre = 'Providencia')
- WHERE id = '<uuid-del-funcionario>';
+   SET tipo = 'admin'
+ WHERE id = '<uuid-del-primer-admin>';
 ```
 
-**Roadmap:** cuando haya >5 funcionarios o múltiples comunas, agregar rol `admin` + endpoint protegido + auditoría (log de quién promovió a quién).
+Después de esto, ese usuario puede promover a otros via endpoint.
+
+### 8.2 Flujo de promoción posterior (vía endpoint)
+
+```http
+PATCH /api/v1/usuarios/{id}/promover
+Authorization: Bearer <jwt-de-admin>
+Content-Type: application/json
+
+{
+  "nuevo_tipo": "municipalidad",
+  "comuna_id": 13
+}
+```
+
+**Reglas validadas en el use case:**
+
+- Solo `tipo='admin'` puede invocar (`current_user_admin`).
+- `nuevo_tipo` debe ser uno de `'ciudadano' | 'municipalidad' | 'admin'`.
+- Si `nuevo_tipo='municipalidad'`, **`comuna_id` es obligatorio** y debe existir en `comuna`. Sin comuna no se puede asignar a funcionario.
+- Si `nuevo_tipo='admin'`, `comuna_id` puede ser `null` (admin es cross-comuna). Si viene, se acepta como afinidad informativa (no afecta autorización).
+- Si `nuevo_tipo='ciudadano'`, **`comuna_id` no se modifica** (el ciudadano conserva su comuna, ya seteada en onboarding).
+- **El admin no puede degradarse a sí mismo** (`id == current_user.id`) — 422 con mensaje claro.
+
+### 8.3 Auditoría
+
+El historial de promociones **no se persiste en una tabla dedicada** en MVP. Si se requiere, se agrega `historial_promocion (id, usuario_id, promovido_por_id, tipo_anterior, tipo_nuevo, comuna_id_anterior, comuna_id_nueva, created_at)` como roadmap. Por ahora, el log de la aplicación queda en stdout de Render con `correlation_id` para cualquier auditoría puntual.
+
+### 8.4 Roadmap
+
+- **Tabla `historial_promocion`** para auditoría completa cuando crezca el equipo.
+- **Endpoint `DELETE /usuarios/{id}/promover`** (revertir promoción) — hoy se logra invocando `PATCH` con el tipo anterior, suficiente para MVP.
 
 ---
 

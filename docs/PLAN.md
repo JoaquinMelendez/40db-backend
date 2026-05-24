@@ -250,6 +250,88 @@ Antes de empezar cualquier paso:
 
 ---
 
+## Paso 10 — Rol `admin` + bootstrap
+
+**Dependencias:** pasos 1, 4.
+
+**Spec:** [`auth.md`](./auth.md) §6 (matriz actualizada), §8 (bootstrap + endpoint).
+
+**Tareas:**
+- Regenerar migración para incluir CHECK extendido en `usuario.tipo` (D9 en `bbdd.md`). Esto implica otro `supabase db reset --linked` cuando se aplique (no en producción real, sin pérdida de data).
+- Agregar dependencies `current_user_admin` y `current_user_municipal_o_admin` en `app/api/deps.py`. Reglas en `auth.md` §5.
+- Crear `app/application/promover_usuario.py` con validaciones de `auth.md` §8.2 (incluyendo no-self-demote).
+- Crear use case `cambiar_activo_usuario` similar.
+- Wrapper en `infrastructure/db/usuario_repo.py` para los PATCH.
+- **Bootstrap del primer admin:** SQL manual una sola vez tras el reset (ver `auth.md` §8.1). Documentar el UUID resultante.
+
+**Done when:**
+- `current_user_admin` rechaza con 403 a ciudadanos y municipales.
+- Promoción ciudadano → municipalidad con `comuna_id` válido → 200 + DB refleja cambio.
+- Promoción ciudadano → municipalidad sin `comuna_id` → 422.
+- Admin intentando degradarse a sí mismo → 422 `cannot_demote_self`.
+
+---
+
+## Paso 11 — Endpoints de sensores (admin/municipalidad)
+
+**Dependencias:** paso 10.
+
+**Spec:** [`api.md`](./api.md) §4.14–§4.19 + [`bbdd.md`](./bbdd.md) §5.5–§5.6.
+
+**Tareas:**
+- Agregar RPCs `sensores_con_salud` y `resumen_salud_sensores` a la migración (`bbdd.md` §5.5/§5.6).
+- Crear `app/domain/entities.py` `Sensor` (si no existe ya con todos los campos).
+- Crear `app/infrastructure/db/sensor_repo.py` con: `listar(comuna_id?, estado_salud?, activo?, cursor, limit)`, `get_by_id(id)`, `resumen(comuna_id?)`, `crear(...)`, `actualizar(id, ...)`, `desactivar(id)`.
+- Use cases en `app/application/`: `listar_sensores`, `obtener_resumen_sensores`, `crear_sensor`, `actualizar_sensor`, `desactivar_sensor`. Cada uno aplica regla de comuna según rol.
+- Routes en `app/api/routes/sensores.py` con las 6 operaciones de §4.14–§4.19.
+- Schemas Pydantic en `app/api/schemas/sensor.py`.
+
+**Done when:**
+- `GET /sensores` como admin lista todos los sensores con `estado_salud` correcto (probar con timestamps muy viejos → `offline`, recientes → `online`).
+- `GET /sensores` como municipalidad filtra por su comuna.
+- `POST /sensores` como admin crea con UUID generado.
+- `DELETE /sensores/{id}` setea `activo=false`.
+
+---
+
+## Paso 12 — Endpoints de usuarios (admin)
+
+**Dependencias:** paso 10.
+
+**Spec:** [`api.md`](./api.md) §4.20–§4.22.
+
+**Tareas:**
+- Extender `app/infrastructure/db/usuario_repo.py` con `listar(tipo?, comuna_id?, activo?, q?, cursor, limit)`. Hacer JOIN a `auth.users` para traer `email`.
+- Use cases `listar_usuarios`, `cambiar_activo_usuario`, `promover_usuario`.
+- Routes en `app/api/routes/usuarios.py` (extender el existente).
+- Schemas Pydantic en `app/api/schemas/usuario.py`.
+
+**Done when:**
+- `GET /usuarios` como admin lista usuarios filtrados.
+- `PATCH /usuarios/{id}/promover` con casos de §4.22 (happy path, sin comuna, self-demote, comuna inexistente).
+- `PATCH /usuarios/{id}/activo` desactiva, y un GET con el JWT del desactivado devuelve 401.
+
+---
+
+## Paso 13 — Soporte de `comuna_id` en `POST /reportes`
+
+**Dependencias:** paso 5 ya implementó el endpoint base.
+
+**Spec:** [`api.md`](./api.md) §4.5 (body actualizado) + §4.5.1 (resolución cliente).
+
+**Tareas (mínimas, son ~10 líneas):**
+- En `app/api/schemas/reporte.py`, agregar `comuna_id: Optional[int]` al `CrearReporteRequest`.
+- En `app/application/crear_reporte.py`, lógica: si `comuna_id` viene → validar contra catálogo, usarlo. Si no → fallback a `usuario.comuna_id`. Si ambos `null` → 422.
+- Sin cambios en la RPC (sigue tomando `p_comuna_id`).
+
+**Done when:**
+- POST con `comuna_id` válido → 201 con `comuna_id` en la respuesta.
+- POST con `comuna_id` inexistente → 422.
+- POST sin `comuna_id` y usuario con `comuna_id` → 201 usando el del usuario.
+- POST sin `comuna_id` y usuario sin `comuna_id` → 422 con mensaje claro.
+
+---
+
 ## Resumen visual de dependencias
 
 ```
@@ -278,6 +360,20 @@ Antes de empezar cualquier paso:
 ```
 
 Pasos 5, 6, 7, 8 son **paralelizables** entre sí una vez completados 1–4.
+
+Pasos 10–13 vienen después y se acoplan así:
+
+```
+9. Tests (puede arrancar después de cualquier paso 5+, en paralelo)
+   │
+10. Rol admin + bootstrap   ◀── requiere 1 (CHECK) y 4 (auth)
+    │
+    ├──▶ 11. Endpoints sensores (admin/municipal)
+    │
+    └──▶ 12. Endpoints usuarios (admin)
+
+13. comuna_id en POST /reportes   ◀── independiente, edita lo existente del paso 5
+```
 
 ---
 
