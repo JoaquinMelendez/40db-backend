@@ -61,18 +61,13 @@ async def crear_reporte(
 ):
     from app.application.crear_reporte import crear_reporte as _uc
 
-    # Si usuario no tiene comuna_id seteada en su perfil, rechazar (puede ajustarse)
-    if usuario.comuna_id is None:
-        from app.domain.errors import ValidationError
-        raise ValidationError("Debés completar tu perfil con una comuna antes de reportar.")
-
     reporte = _uc(
-        usuario_id=usuario.id,
-        comuna_id=usuario.comuna_id,
+        usuario=usuario,
         titulo=body.titulo,
         descripcion=body.descripcion,
         latitud=body.latitud,
         longitud=body.longitud,
+        comuna_id=body.comuna_id,
         lectura_evidencia_id=body.lectura_evidencia_id,
     )
     return _reporte_detalle(reporte)
