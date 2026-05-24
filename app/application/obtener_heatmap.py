@@ -12,7 +12,8 @@ def obtener_heatmap(
     time_start: str,
     time_end: str,
     bucket_minutes: int,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
+    """Devuelve (rows, fuente). fuente ∈ {"matview","rpc"} — ver lectura_repo."""
     from datetime import datetime, timezone
 
     if bucket_minutes not in BUCKET_MINUTES_PERMITIDOS:
