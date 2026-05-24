@@ -94,6 +94,7 @@ Mapeo completo y subtipos en [`errores.md`](./errores.md) §3 y §10.
 | `GET` | `/api/v1/reportes-admin/archivos` | ✅ | admin | Listar archivos (filtrable por `tipo`, `generado_por_id`) |
 | `GET` | `/api/v1/reportes-admin/archivos/{id}/descarga` | ✅ | admin | Signed URL temporal para descargar el archivo |
 | `DELETE` | `/api/v1/reportes-admin/archivos/{id}` | ✅ | admin | Eliminar archivo (blob + metadata) |
+| `GET` | `/api/v1/lecturas/resumen` | ✅ | municipalidad (su comuna) o admin | Serie horaria de un sensor (avg/min/max/p95) servida desde `lectura_resumen_horaria` |
 
 > **Auth flow (signup/login)** vive en Supabase Auth, **no en este backend**. Ver [`auth.md`](./auth.md) §4.
 
@@ -995,6 +996,67 @@ Authorization: Bearer <jwt-admin>
 **Response 204:** sin body.
 
 **Errores:** 401, 403, 404, 503.
+
+---
+
+### 4.27 `GET /api/v1/lecturas/resumen`
+
+Serie temporal horaria de un sensor (avg/min/max/p95 de `nivel_db` + `n_lecturas`). Servido desde la tabla pre-agregada `lectura_resumen_horaria` (refrescada cada hora por `pg_cron`, ver [`bbdd.md`](./bbdd.md) §13). Alimenta gráficos del panel municipal sin escanear `lectura` cruda.
+
+```http
+GET /api/v1/lecturas/resumen
+  ?sensor_id=1e2c0f8a-...
+  &desde=2026-05-17T00:00:00Z
+  &hasta=2026-05-24T00:00:00Z
+Authorization: Bearer <jwt>
+```
+
+**Query params:**
+
+| Param | Tipo | Obligatorio | Default | Notas |
+|---|---|---|---|---|
+| `sensor_id` | UUID | ✅ | — | El sensor cuya serie se pide. |
+| `desde` | ISO 8601 | ✅ | — | Inicio de ventana (inclusivo, alineado a hora). |
+| `hasta` | ISO 8601 | ✅ | — | Fin de ventana (exclusivo). Max 90 días desde `desde`. |
+
+**Auth:**
+- `municipalidad`: el sensor debe ser de su comuna (404 si no).
+- `admin`: cualquier sensor.
+
+**Response 200:**
+
+```json
+{
+  "sensor_id": "1e2c0f8a-...",
+  "sensor_nombre": "Plaza Italia - Norte",
+  "desde": "2026-05-17T00:00:00Z",
+  "hasta": "2026-05-24T00:00:00Z",
+  "horas": [
+    {
+      "hora": "2026-05-17T00:00:00Z",
+      "avg_db": 52.34,
+      "min_db": 41.2,
+      "max_db": 68.7,
+      "p95_db": 63.1,
+      "n_lecturas": 720
+    },
+    { "hora": "2026-05-17T01:00:00Z", "avg_db": 48.10, "...": "..." }
+  ],
+  "fuente": "lectura_resumen_horaria",
+  "refrescado_at": "2026-05-24T14:05:00Z"
+}
+```
+
+**Notas:**
+- Las horas sin lecturas **no aparecen** en el array (el frontend rellena con `null` si quiere gráfico continuo).
+- `refrescado_at` es el `MAX(refrescado_at)` sobre las filas del rango — el cliente sabe si está mirando un agregado fresco o el último cron run.
+- Si la ventana incluye la hora en curso, esa hora puede no estar en la respuesta (el cron corre al minuto 5 de cada hora).
+
+**Errores:**
+- 401 sin JWT.
+- 403 si municipalidad pide un sensor de otra comuna.
+- 404 si el sensor no existe.
+- 422 si `hasta - desde > 90 días` o ventana negativa.
 
 ---
 

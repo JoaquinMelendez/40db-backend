@@ -732,7 +732,7 @@ El particionamiento de `lectura` **ya no es roadmap** — está incorporado al M
 - **Compresión:** Postgres nativo no comprime particiones (a diferencia de TimescaleDB). Si la huella en disco se vuelve un problema, evaluar `pg_squeeze` o migrar al stack alternativo descrito en `backend.md` §9.
 
 ### 10.4 Vista materializada para heatmap
-Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios por celda H3/geohash + bucket de 5 minutos. Refresh incremental on-demand o vía pg_cron.
+**Promovida del roadmap al MVP.** Ver §13 para la spec canónica (DDL, refresh, integración con `heatmap_agregado`). Esta entrada se conserva solo como pointer histórico.
 
 ---
 
@@ -808,7 +808,184 @@ Si el GET de heatmap se vuelve lento, agregar `mv_heatmap_5min` con promedios po
 
 - `validacion_iot` (N:M) — §10.1.
 - **Automatización** con `pg_partman` y política de retención — §10.3 (las particiones iniciales sí están en el MVP, ver §3.5.1).
-- Vista materializada heatmap — §10.4.
 - Políticas RLS para acceso cliente — §10.2.
 
 No agregar nada de eso en la migración inicial.
+
+> **Nota.** La vista materializada de heatmap y la tabla `lectura_resumen_horaria` **no están** en la migración inicial. Viven en una migración separada (§13), aplicada después de que el flujo IoT esté funcionando — así la primera migración no se contamina con objetos que dependen de tener `lectura` cargada con datos representativos.
+
+---
+
+## 13. Capa de agregación: rollups horarios + matview de heatmap (OLAP intra-Postgres)
+
+Esta sección define la **capa analítica** del proyecto: agregaciones precomputadas sobre `lectura` (la tabla OLTP, particionada, ~100M rows/año proyectados — `iot.md` §4) que sirven a dashboards históricos y al endpoint `/heatmaps` sin escanear datos crudos en cada request.
+
+**Posición arquitectónica.** Es la respuesta al volumen de time-series **sin agregar infra fuera de Postgres** (no Spark, no DuckDB externo, no Kafka). Implementa el patrón clásico de **rollup batch** (downsample horario por sensor) + **matview con refresh periódico** (heatmap de los últimos 7 días). Ver decisión arquitectónica completa en [`backend.md`](./backend.md) ADR 09.
+
+### 13.1 Tabla `lectura_resumen_horaria` (rollup horario por sensor)
+
+Una row por `(sensor, hora)`. Sirve a series temporales (gráficos del panel municipal, históricos de un sensor, KPIs por hora del día). Refresh idempotente vía función SQL + `pg_cron`.
+
+```sql
+CREATE TABLE lectura_resumen_horaria (
+  sensor_id     uuid          NOT NULL REFERENCES sensor(id) ON DELETE CASCADE,
+  hora          timestamptz   NOT NULL,           -- inicio de la hora (date_bin)
+  avg_db        numeric(5, 2) NOT NULL,
+  min_db        numeric(5, 2) NOT NULL,
+  max_db        numeric(5, 2) NOT NULL,
+  p95_db        numeric(5, 2) NOT NULL,           -- percentile_cont(0.95)
+  n_lecturas    integer       NOT NULL CHECK (n_lecturas > 0),
+  refrescado_at timestamptz   NOT NULL DEFAULT now(),
+  PRIMARY KEY (sensor_id, hora)
+);
+
+CREATE INDEX idx_resumen_horaria_hora        ON lectura_resumen_horaria (hora DESC);
+CREATE INDEX idx_resumen_horaria_sensor_hora ON lectura_resumen_horaria (sensor_id, hora DESC);
+```
+
+**Volumen.** 30 sensores × 24 h × 365 días ≈ **263k rows/año** ≈ ~20 MB. Cabe holgado en Supabase free (límite 500 MB).
+
+**Por qué tabla y no matview.** Necesitamos:
+- Refresh **incremental** (solo la última hora + ventana de gracia para QoS 1 retrasado), no `REFRESH MATERIALIZED VIEW` completo.
+- Permitir **backfill manual** por rango (`refrescar_resumen_horario('2026-05-01')`).
+- `UPSERT` controlado vía `ON CONFLICT`, no recomputar 8M rows cada hora.
+
+### 13.2 Función `refrescar_resumen_horario` (idempotente)
+
+```sql
+CREATE OR REPLACE FUNCTION public.refrescar_resumen_horario(
+  p_desde timestamptz DEFAULT NULL
+)
+RETURNS integer
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_desde timestamptz := COALESCE(
+    p_desde,
+    date_trunc('hour', now()) - interval '2 hours'  -- gracia QoS 1
+  );
+  v_filas integer;
+BEGIN
+  INSERT INTO lectura_resumen_horaria
+    (sensor_id, hora, avg_db, min_db, max_db, p95_db, n_lecturas, refrescado_at)
+  SELECT
+    l.sensor_id,
+    date_bin(interval '1 hour', l.timestamp_medicion, '2000-01-01'::timestamptz) AS hora,
+    ROUND(AVG(l.nivel_db)::numeric, 2),
+    MIN(l.nivel_db),
+    MAX(l.nivel_db),
+    ROUND(percentile_cont(0.95) WITHIN GROUP (ORDER BY l.nivel_db)::numeric, 2),
+    COUNT(*),
+    now()
+  FROM lectura l
+  WHERE l.timestamp_medicion >= v_desde
+  GROUP BY l.sensor_id,
+           date_bin(interval '1 hour', l.timestamp_medicion, '2000-01-01'::timestamptz)
+  ON CONFLICT (sensor_id, hora) DO UPDATE SET
+    avg_db        = EXCLUDED.avg_db,
+    min_db        = EXCLUDED.min_db,
+    max_db        = EXCLUDED.max_db,
+    p95_db        = EXCLUDED.p95_db,
+    n_lecturas    = EXCLUDED.n_lecturas,
+    refrescado_at = EXCLUDED.refrescado_at;
+
+  GET DIAGNOSTICS v_filas = ROW_COUNT;
+  RETURN v_filas;
+END;
+$$;
+```
+
+**Notas:**
+- Origen `2000-01-01` en `date_bin` garantiza buckets alineados entre invocaciones (mismo criterio que `heatmap_agregado` §5.4).
+- La ventana de gracia de 2 h absorbe lecturas QoS 1 retrasadas (HiveMQ → backend → Postgres puede demorar segundos a minutos en escenarios degradados).
+- Backfill: `SELECT refrescar_resumen_horario('2026-05-01'::timestamptz);` recomputa desde esa fecha.
+- Es `SECURITY INVOKER` (default). Si Supabase `pg_cron` corre como `postgres`, accede sin problema. Si se ejecuta desde el backend, el `service_role` la puede llamar también.
+
+### 13.3 Vista materializada `mv_heatmap_celda_bucket`
+
+Precomputa el heatmap de **buckets de 5 minutos en los últimos 7 días** — la combinación de parámetros que el frontend pedirá el ~90% del tiempo. Para ventanas custom o bucket distinto, el endpoint `/heatmaps` cae al RPC `heatmap_agregado` (§5.4) que escanea `lectura` directo.
+
+```sql
+CREATE MATERIALIZED VIEW mv_heatmap_celda_bucket AS
+SELECT
+  (round((s.longitud / 0.001)::numeric) * 0.001)::double precision AS lng_cell,
+  (round((s.latitud  / 0.001)::numeric) * 0.001)::double precision AS lat_cell,
+  date_bin(interval '5 minutes', l.timestamp_medicion, '2000-01-01'::timestamptz) AS bucket_start,
+  ROUND(AVG(l.nivel_db)::numeric, 2) AS nivel_db_avg,
+  MAX(l.nivel_db)                    AS nivel_db_max,
+  COUNT(*)                           AS lectura_count
+FROM lectura l
+JOIN sensor  s ON s.id = l.sensor_id
+WHERE l.timestamp_medicion >= now() - interval '7 days'
+GROUP BY 1, 2, 3;
+
+-- UNIQUE obligatorio para REFRESH ... CONCURRENTLY
+CREATE UNIQUE INDEX idx_mv_heatmap_unique
+  ON mv_heatmap_celda_bucket (lng_cell, lat_cell, bucket_start);
+
+CREATE INDEX idx_mv_heatmap_bucket
+  ON mv_heatmap_celda_bucket (bucket_start DESC);
+```
+
+**Refresh.** `REFRESH MATERIALIZED VIEW CONCURRENTLY mv_heatmap_celda_bucket;` cada 15 min vía `pg_cron`. `CONCURRENTLY` evita lock de lectura (los GETs al endpoint siguen sirviendo la versión anterior mientras se refresca).
+
+**Volumen estimado.** 30 sensores × 7 días × 288 buckets/día (12 por hora) = ~60k rows si todos los sensores publican constantemente. Si los sensores comparten celda (mismo ~100 m), menos. Cabe en free.
+
+**Limitación honesta.** La cláusula `WHERE l.timestamp_medicion >= now() - interval '7 days'` se **congela** al momento del `CREATE MATERIALIZED VIEW` — Postgres no re-evalúa `now()` en cada refresh. Solución: re-crear la matview periódicamente (ej. una vez al mes con `DROP + CREATE`) o aceptar que la ventana se va corriendo "hacia adelante" sin perder datos pero acumulando rows viejos. Como la matview es delete-and-rebuild barato (~60k rows), el camino canónico es: drop + create en el cron mensual de mantenimiento.
+
+### 13.4 Schedule con `pg_cron`
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Rollup horario: minuto 5 de cada hora (margen para últimas lecturas)
+SELECT cron.schedule(
+  'refrescar_resumen_horario',
+  '5 * * * *',
+  $$SELECT public.refrescar_resumen_horario();$$
+);
+
+-- Matview heatmap: cada 15 min
+SELECT cron.schedule(
+  'refrescar_mv_heatmap',
+  '*/15 * * * *',
+  $$REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_heatmap_celda_bucket;$$
+);
+```
+
+**Disponibilidad de `pg_cron` en Supabase.** Sí, en todos los planes incluido Free. Dashboard → Database → Extensions → activar `pg_cron`. La extensión vive en la base `postgres` (la default de Supabase) y schedule jobs sobre cualquier base del cluster.
+
+**Inspección:**
+```sql
+SELECT * FROM cron.job;                       -- jobs registrados
+SELECT * FROM cron.job_run_details
+  ORDER BY start_time DESC LIMIT 20;          -- últimos runs (status, duración, errores)
+```
+
+### 13.5 Integración con el endpoint `/heatmaps`
+
+La RPC `heatmap_agregado` (§5.4) **no cambia** (sigue funcionando contra `lectura` cruda). Lo que cambia es el adaptador:
+
+`LecturaRepository.heatmap(bbox, time_start, time_end, bucket_minutes)`:
+1. **Si** `bucket_minutes == 5` **y** `time_end >= now() - interval '7 days'` **y** `time_start >= now() - interval '7 days'`:
+   - Sirve desde `mv_heatmap_celda_bucket` con filtro de bbox (`lng_cell BETWEEN … AND lat_cell BETWEEN …`).
+2. **Si no**: invoca el RPC `heatmap_agregado` original.
+
+Esto se decide en el adapter (`infrastructure/db/lectura_repo.py`), transparente para el use case y el endpoint. El response shape es idéntico — la matview proyecta las mismas columnas que el RPC.
+
+### 13.6 Trazabilidad
+
+| Objeto | Vive en | Refresh | Sirve a |
+|---|---|---|---|
+| `lectura_resumen_horaria` | Tabla | `pg_cron`: `'5 * * * *'` | `GET /api/v1/lecturas/resumen` (panel municipal) |
+| `mv_heatmap_celda_bucket` | Materialized view | `pg_cron`: `'*/15 * * * *'` | `GET /api/v1/heatmaps` (vía adapter, fallback a RPC) |
+| `refrescar_resumen_horario(p_desde)` | Function | — | Backfill manual + cron horario |
+
+### 13.7 Por qué esto cuenta como "big data" para el proyecto de título
+
+Aunque vive 100% dentro de Postgres, esta capa cubre las 3 V típicas del enunciado académico:
+
+- **Volumen.** Diseño escala a ~100M rows/año en `lectura` (particionada). El rollup mantiene una capa servible en ~263k rows que evita escanear los 100M en cada request.
+- **Velocidad.** Ingesta MQTT continua (cada 5–10s por sensor) → tabla particionada → agregaciones batch periódicas (pipeline lambda-arquitectónico minimalista: hot OLTP + warm OLAP precomputado).
+- **Variedad.** Cross-join entre datos IoT (`lectura`), reportes ciudadanos (`reporte`), catálogo geoespacial (`sensor` con PostGIS), y derivados estadísticos (avg/p95/etc).
+
+Patrón clásico de **downsampling de time-series** + **agregación geoespacial precomputada** + **scheduling declarativo (cron-as-SQL)**. Defensible en tribunal sin vender promesas de infra que no se sostienen ($0/mes en free tier).
