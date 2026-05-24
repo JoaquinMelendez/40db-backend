@@ -5,6 +5,7 @@ paho-mqtt
 pydantic-settings
 pyjwt[crypto]
 python-ulid
+python-multipart
 
 # Dev / test
 pytest

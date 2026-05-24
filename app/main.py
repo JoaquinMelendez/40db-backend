@@ -49,7 +49,7 @@ app.add_middleware(
 from app.api.middleware.correlation import CorrelationMiddleware
 from app.api.error_handlers import register_handlers
 from app.api.routes import health
-from app.api.routes import reportes, heatmaps, usuarios, catalogos, sensores
+from app.api.routes import reportes, heatmaps, usuarios, catalogos, sensores, reportes_admin_archivos
 
 app.add_middleware(CorrelationMiddleware)
 register_handlers(app)
@@ -60,3 +60,4 @@ app.include_router(heatmaps.router, prefix=settings.api_prefix)
 app.include_router(usuarios.router, prefix=settings.api_prefix)
 app.include_router(catalogos.router, prefix=settings.api_prefix)
 app.include_router(sensores.router, prefix=settings.api_prefix)
+app.include_router(reportes_admin_archivos.router, prefix=settings.api_prefix)
