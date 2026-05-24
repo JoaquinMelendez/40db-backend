@@ -1,5 +1,6 @@
+from datetime import datetime
 from typing import Protocol, Optional
-from app.domain.entities import Usuario, Reporte, Sensor
+from app.domain.entities import Usuario, Reporte, ResumenHorario, Sensor
 
 
 class UsuarioRepository(Protocol):
@@ -11,6 +12,15 @@ class ReporteRepository(Protocol):
     def get_by_id(self, reporte_id: str) -> Optional[Reporte]: ...
     def list_by_usuario(self, usuario_id: str, limit: int, cursor: Optional[str]) -> tuple[list[Reporte], Optional[str]]: ...
     def list_by_comuna(self, comuna_id: int, limit: int, cursor: Optional[str], estado: Optional[str]) -> tuple[list[Reporte], Optional[str]]: ...
+
+
+class ResumenHorarioRepository(Protocol):
+    def listar(
+        self,
+        sensor_id: str,
+        desde: datetime,
+        hasta: datetime,
+    ) -> list[ResumenHorario]: ...
 
 
 class SensorRepository(Protocol):

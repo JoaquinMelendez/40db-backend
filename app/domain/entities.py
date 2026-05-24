@@ -42,6 +42,18 @@ class Lectura:
 
 
 @dataclass
+class ResumenHorario:
+    sensor_id: str
+    hora: datetime
+    avg_db: float
+    min_db: float
+    max_db: float
+    p95_db: float
+    n_lecturas: int
+    refrescado_at: datetime
+
+
+@dataclass
 class EvidenciaIot:
     lectura_id: int
     sensor_id: str
