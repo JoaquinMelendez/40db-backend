@@ -1,5 +1,5 @@
 from typing import Protocol, Optional
-from app.domain.entities import Usuario, Reporte
+from app.domain.entities import Usuario, Reporte, Sensor
 
 
 class UsuarioRepository(Protocol):
@@ -11,3 +11,26 @@ class ReporteRepository(Protocol):
     def get_by_id(self, reporte_id: str) -> Optional[Reporte]: ...
     def list_by_usuario(self, usuario_id: str, limit: int, cursor: Optional[str]) -> tuple[list[Reporte], Optional[str]]: ...
     def list_by_comuna(self, comuna_id: int, limit: int, cursor: Optional[str], estado: Optional[str]) -> tuple[list[Reporte], Optional[str]]: ...
+
+
+class SensorRepository(Protocol):
+    def listar(
+        self,
+        comuna_id: Optional[int],
+        estado_salud: Optional[str],
+        activo: Optional[bool],
+        limit: int,
+        cursor: Optional[str],
+    ) -> tuple[list[Sensor], Optional[str]]: ...
+    def get_by_id(self, sensor_id: str) -> Optional[Sensor]: ...
+    def resumen(self, comuna_id: Optional[int]) -> dict: ...
+    def crear(self, nombre: str, comuna_id: int, latitud: float, longitud: float) -> Sensor: ...
+    def actualizar(
+        self,
+        sensor_id: str,
+        nombre: Optional[str],
+        latitud: Optional[float],
+        longitud: Optional[float],
+        activo: Optional[bool],
+    ) -> Optional[Sensor]: ...
+    def desactivar(self, sensor_id: str) -> Optional[Sensor]: ...
