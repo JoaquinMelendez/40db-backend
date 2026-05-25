@@ -52,6 +52,9 @@ class ReporteDetalle(BaseModel):
     longitud: float
     estado_actual: Optional[str]
     historial: Optional[list] = None
+    # Filtrado según rol del caller (dueño ve solo externos; municipalidad/admin
+    # ven ambos). El use case decide qué incluir. Detalle en api.md §4.8.
+    comentarios: Optional[list] = None
     lectura_evidencia: Optional[EvidenciaSchema]
     created_at: Optional[datetime]
 
