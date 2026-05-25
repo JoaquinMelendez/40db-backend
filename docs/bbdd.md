@@ -232,6 +232,59 @@ CREATE INDEX idx_historial_reporte_created
   ON historial_estado(reporte_id, created_at DESC);
 ```
 
+### 3.8 Comentarios del reporte
+
+Mensajes adjuntos al reporte, separados del historial de estados. Sirven para dos audiencias distintas:
+
+- **Internos** (`visibilidad = 'interno'`): solo funcionarios `municipalidad` (de la comuna del reporte) y `admin` los ven. Pueden incluir una **delegación estructurada** (campos `delegado_a_id` + `delegado_at`) — el frontend renderiza "Delegado a: X a las HH:MM" sin parsear texto libre.
+- **Externos** (`visibilidad = 'externo'`): el vecino dueño del reporte los ve también. Texto libre tipo "Esto fue derivado a una patrulla municipal, ya van en camino."
+
+Por qué tabla nueva en vez de extender `historial_estado`:
+
+- `historial_estado.tipo_estado_id` es `NOT NULL` y el trigger `set_initial_estado` garantiza que **todo reporte tiene al menos un estado**. Permitir comentarios sin transición de estado requeriría relajar ambos.
+- Semánticamente son cosas distintas: `historial_estado` es "quién cambió a qué estado y cuándo", `reporte_comentario` es "quién dejó un mensaje, para quién". El timeline combinado (si el frontend lo quiere) se obtiene con `UNION` en lectura.
+
+```sql
+CREATE TABLE reporte_comentario (
+  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  reporte_id     uuid    NOT NULL REFERENCES reporte(id) ON DELETE CASCADE,
+  autor_id       uuid    NOT NULL REFERENCES usuario(id),
+  visibilidad    text    NOT NULL
+                 CHECK (visibilidad IN ('interno', 'externo')),
+  cuerpo         text    NOT NULL CHECK (length(btrim(cuerpo)) > 0),
+  -- Delegación estructurada. Solo aplica a internos.
+  delegado_a_id  uuid    REFERENCES usuario(id),
+  delegado_at    timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT chk_delegacion_pair CHECK (
+    (delegado_a_id IS NULL AND delegado_at IS NULL)
+    OR (
+      visibilidad = 'interno'
+      AND delegado_a_id IS NOT NULL
+      AND delegado_at IS NOT NULL
+    )
+  )
+);
+
+CREATE INDEX idx_reporte_comentario_reporte_created
+  ON reporte_comentario(reporte_id, created_at DESC);
+-- "Reportes delegados a mí" (futuro). Parcial: solo filas con delegación.
+CREATE INDEX idx_reporte_comentario_delegado
+  ON reporte_comentario(delegado_a_id, delegado_at DESC)
+  WHERE delegado_a_id IS NOT NULL;
+```
+
+**Autorización (resumida — el contrato vive en `api.md` §4.28/§4.29):**
+
+| Rol | Escribir interno | Escribir externo | Leer interno | Leer externo |
+|---|---|---|---|---|
+| ciudadano (dueño del reporte) | ❌ | ❌ | ❌ | ✅ |
+| municipalidad (de la comuna) | ✅ | ✅ | ✅ | ✅ |
+| admin | ✅ | ✅ | ✅ | ✅ |
+| cualquier otro | ❌ | ❌ | ❌ | ❌ |
+
+`delegado_a_id` referencia `usuario(id)` sin filtro de `tipo` a nivel DB; el use case valida que sea un usuario con `tipo='municipalidad'` antes de insertar.
+
 ---
 
 ## 4. Triggers

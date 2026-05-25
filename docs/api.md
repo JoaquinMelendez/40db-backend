@@ -75,8 +75,10 @@ Mapeo completo y subtipos en [`errores.md`](./errores.md) §3 y §10.
 | `POST` | `/api/v1/reportes` | ✅ | ciudadano+ | Crear reporte (con evidencia opcional) |
 | `GET` | `/api/v1/reportes/mios` | ✅ | ciudadano+ | "Mis reportes" del usuario autenticado |
 | `GET` | `/api/v1/reportes/comuna/{comuna_id}` | ✅ | municipalidad de esa comuna | Panel funcionario |
-| `GET` | `/api/v1/reportes/{id}` | ✅ | dueño o municipalidad de la comuna | Detalle |
+| `GET` | `/api/v1/reportes/{id}` | ✅ | dueño, municipalidad de la comuna o admin | Detalle |
 | `PATCH` | `/api/v1/reportes/{id}/estado` | ✅ | municipalidad de la comuna | Cambio de estado |
+| `POST` | `/api/v1/reportes/{id}/comentarios` | ✅ | municipalidad de la comuna o admin | Agregar comentario interno/externo |
+| `GET` | `/api/v1/reportes/{id}/comentarios` | ✅ | dueño (solo externos) o municipalidad/admin | Timeline de comentarios |
 | `PATCH` | `/api/v1/usuarios/me` | ✅ | el propio | Onboarding (`telefono`, `comuna_id`) |
 | `GET` | `/api/v1/usuarios/me` | ✅ | el propio | Perfil propio |
 | `GET` | `/api/v1/comunas` | ❌ | público | Catálogo de comunas (dropdown del frontend) |
@@ -392,7 +394,7 @@ GET /api/v1/reportes/0f8c...
 Authorization: Bearer <jwt>
 ```
 
-**Auth:** el dueño del reporte (`usuario_id == auth.uid`), o funcionario `municipalidad` de la misma comuna.
+**Auth:** el dueño del reporte (`usuario_id == auth.uid`), funcionario `municipalidad` de la misma comuna, o `admin`.
 
 **Response 200:**
 ```json
@@ -410,9 +412,35 @@ Authorization: Bearer <jwt>
     { "estado": "En espera", "comentario": null, "created_at": "...", "usuario": null },
     { "estado": "En atencion", "comentario": "Tomando el caso", "created_at": "...", "usuario": { "id": "...", "nombre": "..." } }
   ],
+  "comentarios": [
+    {
+      "id": 42,
+      "visibilidad": "externo",
+      "cuerpo": "Esto fue derivado a una patrulla municipal, ya van en camino.",
+      "autor": { "id": "...", "nombre": "..." },
+      "delegado_a": null,
+      "delegado_at": null,
+      "created_at": "..."
+    },
+    {
+      "id": 43,
+      "visibilidad": "interno",
+      "cuerpo": "Delegación de turno",
+      "autor": { "id": "...", "nombre": "..." },
+      "delegado_a": { "id": "...", "nombre": "Juanito Pérez" },
+      "delegado_at": "2026-05-24T22:00:00Z",
+      "created_at": "..."
+    }
+  ],
   "lectura_evidencia": { /* mismo shape que en POST response */ } 
 }
 ```
+
+El array `comentarios` se filtra según el rol del caller:
+- **dueño del reporte (ciudadano)**: solo recibe los `externo`.
+- **municipalidad de la comuna / admin**: recibe ambos (`interno` + `externo`).
+
+Detalle completo de creación/listado en §4.28 y §4.29.
 
 **Errores:** 401, 403, 404 (`reporte_not_found`).
 
@@ -1057,6 +1085,99 @@ Authorization: Bearer <jwt>
 - 403 si municipalidad pide un sensor de otra comuna.
 - 404 si el sensor no existe.
 - 422 si `hasta - desde > 90 días` o ventana negativa.
+
+---
+
+### 4.28 `POST /api/v1/reportes/{id}/comentarios`
+
+Agregar un comentario al reporte. Dos tipos según `visibilidad`:
+
+- `interno`: visible solo para funcionarios (municipalidad de la comuna y admin). Puede incluir delegación estructurada.
+- `externo`: visible también para el ciudadano dueño del reporte. Texto libre.
+
+```http
+POST /api/v1/reportes/0f8c.../comentarios
+Authorization: Bearer <jwt>
+Content-Type: application/json
+```
+
+**Body (interno con delegación):**
+```json
+{
+  "visibilidad": "interno",
+  "cuerpo": "Delegación de turno noche",
+  "delegado_a_id": "11111111-2222-3333-4444-555555555555",
+  "delegado_at": "2026-05-24T22:00:00Z"
+}
+```
+
+**Body (interno simple, sin delegación):**
+```json
+{
+  "visibilidad": "interno",
+  "cuerpo": "Pendiente confirmar el horario con el inspector."
+}
+```
+
+**Body (externo):**
+```json
+{
+  "visibilidad": "externo",
+  "cuerpo": "Esto fue derivado a una patrulla municipal, ya van en camino."
+}
+```
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `visibilidad` | `"interno" \| "externo"` | ✅ | — |
+| `cuerpo` | `string` (1–2000) | ✅ | Texto del comentario (trim no vacío). |
+| `delegado_a_id` | uuid | Solo si hay delegación | Debe ser `tipo='municipalidad'`. |
+| `delegado_at` | ISO 8601 | Solo si hay delegación | Si va `delegado_a_id`, va este también. |
+
+**Reglas (validadas en use case + DB CHECK):**
+- `delegado_a_id` y `delegado_at` van **juntos o ninguno**.
+- Si hay delegación, `visibilidad` **debe ser `interno`**.
+- Un comentario `externo` no puede tener delegación.
+
+**Auth:** `tipo='municipalidad'` Y `usuario.comuna_id == reporte.comuna_id`, o `tipo='admin'`.
+
+**Response 201:** el comentario creado, mismo shape que cada elemento del array `comentarios` de §4.8.
+
+**Errores:**
+- 401, 403 (`forbidden`), 404 (`reporte_not_found`).
+- 422 si `delegado_a_id` no existe / no es `municipalidad`, o si el body viola las reglas de coherencia.
+
+---
+
+### 4.29 `GET /api/v1/reportes/{id}/comentarios`
+
+Lista los comentarios de un reporte, ordenados por `created_at ASC`. Filtro de visibilidad según rol del caller (mismo criterio que §4.8).
+
+```http
+GET /api/v1/reportes/0f8c.../comentarios
+Authorization: Bearer <jwt>
+```
+
+**Auth:** dueño del reporte (solo externos), municipalidad de la comuna (ambos) o admin (ambos).
+
+**Response 200:**
+```json
+{
+  "data": [
+    {
+      "id": 42,
+      "visibilidad": "externo",
+      "cuerpo": "Esto fue derivado a una patrulla municipal, ya van en camino.",
+      "autor": { "id": "...", "nombre": "..." },
+      "delegado_a": null,
+      "delegado_at": null,
+      "created_at": "..."
+    }
+  ]
+}
+```
+
+**Errores:** 401, 403, 404 (`reporte_not_found`).
 
 ---
 
