@@ -9,6 +9,9 @@ from app.api.schemas.reporte import (
     CrearReporteRequest, ReporteDetalle, ReporteResumen,
     ListaReportesResponse, CambiarEstadoRequest,
 )
+from app.api.schemas.reporte_comentario import (
+    CrearComentarioRequest, ComentarioResponse, ListaComentariosResponse,
+)
 
 router = APIRouter(prefix="/reportes", tags=["reportes"])
 
@@ -124,10 +127,16 @@ async def obtener_reporte(
     es_municipal_de_comuna = (
         usuario.tipo == "municipalidad" and usuario.comuna_id == reporte.comuna_id
     )
-    if not (es_dueno or es_municipal_de_comuna):
+    es_admin = usuario.tipo == "admin"
+    if not (es_dueno or es_municipal_de_comuna or es_admin):
         raise ForbiddenError("No tenés permiso para ver este reporte.")
 
-    return _reporte_detalle(reporte)
+    detalle = _reporte_detalle(reporte)
+    # api.md §4.8: dueño ciudadano → solo externos; municipalidad/admin → ambos.
+    # listar_comentarios resuelve el filtro según el rol del caller.
+    from app.application.reporte_comentarios import listar_comentarios as _listar
+    detalle.comentarios = _listar(reporte_id, usuario)
+    return detalle
 
 
 @router.patch("/{reporte_id}/estado", response_model=ReporteDetalle)
@@ -143,4 +152,41 @@ async def cambiar_estado(
         usuario=usuario,
         comentario=body.comentario,
     )
-    return _reporte_detalle(reporte)
+    detalle = _reporte_detalle(reporte)
+    # Funcionario de la comuna → ve ambos tipos de comentarios.
+    from app.application.reporte_comentarios import listar_comentarios as _listar
+    detalle.comentarios = _listar(reporte_id, usuario)
+    return detalle
+
+
+@router.post(
+    "/{reporte_id}/comentarios",
+    response_model=ComentarioResponse,
+    status_code=201,
+)
+async def crear_comentario(
+    reporte_id: str,
+    body: CrearComentarioRequest,
+    usuario: Usuario = Depends(current_user),
+):
+    from app.application.reporte_comentarios import agregar_comentario
+    return agregar_comentario(
+        reporte_id=reporte_id,
+        usuario=usuario,
+        visibilidad=body.visibilidad,
+        cuerpo=body.cuerpo,
+        delegado_a_id=body.delegado_a_id,
+        delegado_at=body.delegado_at,
+    )
+
+
+@router.get(
+    "/{reporte_id}/comentarios",
+    response_model=ListaComentariosResponse,
+)
+async def listar_comentarios_endpoint(
+    reporte_id: str,
+    usuario: Usuario = Depends(current_user),
+):
+    from app.application.reporte_comentarios import listar_comentarios
+    return ListaComentariosResponse(data=listar_comentarios(reporte_id, usuario))
