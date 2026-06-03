@@ -11,6 +11,7 @@ from app.domain.errors import (
     ReporteNotFoundError, ComunaMismatchError, InvalidStateTransitionError,
     ExternalServiceError, ValidationError,
 )
+from app.domain import ports
 from app.application.cambiar_estado_reporte import _TRANSICIONES_VALIDAS
 
 
