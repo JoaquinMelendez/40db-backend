@@ -1,0 +1,12 @@
+# Configuración de Ruff (linter de Python).
+# Usa el set de reglas por defecto de Ruff: E4/E7/E9 (pycodestyle) + F (pyflakes).
+# No se activa E501 (largo de línea) a propósito: el código ya tiene líneas
+# largas deliberadas (queries, selects de PostgREST) y no aporta exigirlo.
+
+target-version = "py39"
+
+[lint.per-file-ignores]
+# app/main.py importa los routers DESPUÉS de registrar el middleware de CORS
+# a propósito (el orden es intencional y está comentado en el archivo: así el
+# arranque falla explícito si falta algo). E402 no aplica acá.
+"app/main.py" = ["E402"]

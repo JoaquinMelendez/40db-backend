@@ -12,7 +12,7 @@ def _cid(request: Request) -> str:
 
 
 def register_handlers(app: FastAPI) -> None:
-    from app.domain.errors import DomainError, ExternalServiceError
+    from app.domain.errors import DomainError
 
     @app.exception_handler(httpx.HTTPError)
     async def supabase_http_handler(request: Request, exc: httpx.HTTPError):

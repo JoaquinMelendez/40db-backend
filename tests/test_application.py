@@ -1,10 +1,10 @@
 import pytest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from app.core.config import settings
 from app.domain.entities import (
-    Usuario, Sensor, Lectura, ResumenHorario, EvidenciaIot,
+    Usuario, Sensor, ResumenHorario, EvidenciaIot,
     ReporteArchivoAdmin, Reporte
 )
 from app.domain.errors import (

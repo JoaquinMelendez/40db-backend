@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import Depends, Request
+from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from jwt import PyJWKClient

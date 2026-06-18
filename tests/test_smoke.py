@@ -21,8 +21,7 @@ from app.api.deps import (
     current_user_municipal_o_admin, current_user_municipal_de_comuna,
 )
 from app.domain.entities import (
-    Usuario, Reporte, Sensor, ResumenHorario,
-    EvidenciaIot, ReporteArchivoAdmin,
+    Usuario, Reporte, Sensor, ReporteArchivoAdmin,
 )
 
 client = TestClient(app, raise_server_exceptions=False)
