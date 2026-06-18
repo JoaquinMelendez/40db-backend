@@ -1,9 +1,7 @@
 import pytest
 import jwt
-import httpx
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
-from fastapi import FastAPI, Depends, HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -13,9 +11,9 @@ from app.api.deps import (
     current_user_municipal_o_admin, current_user_municipal_de_comuna,
     _decode_jwt
 )
-from app.domain.entities import Usuario, Reporte, Sensor, ResumenHorario, EvidenciaIot
+from app.domain.entities import Usuario, Reporte, Sensor, EvidenciaIot
 from app.domain.errors import (
-    NotFoundError, ValidationError, ForbiddenError, ComunaMismatchError, InvalidTokenError, UnauthorizedError
+    NotFoundError, ForbiddenError, ComunaMismatchError, InvalidTokenError, UnauthorizedError
 )
 
 client = TestClient(app)

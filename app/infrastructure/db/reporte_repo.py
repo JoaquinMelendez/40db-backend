@@ -1,4 +1,5 @@
-import base64, json
+import base64
+import json
 from typing import Optional
 from app.core.supabase_client import get_supabase
 from app.domain.entities import Reporte, EvidenciaIot
@@ -7,14 +8,14 @@ from app.domain.entities import Reporte, EvidenciaIot
 def _row_to_reporte(row: dict) -> Reporte:
     evidencia = None
     if row.get("lectura_evidencia_id") and row.get("lectura"):
-        l = row["lectura"]
+        lec = row["lectura"]
         evidencia = EvidenciaIot(
-            lectura_id=l["id"],
-            sensor_id=l["sensor_id"],
-            sensor_nombre=l.get("sensor", {}).get("nombre", ""),
-            nivel_db=float(l["nivel_db"]),
+            lectura_id=lec["id"],
+            sensor_id=lec["sensor_id"],
+            sensor_nombre=lec.get("sensor", {}).get("nombre", ""),
+            nivel_db=float(lec["nivel_db"]),
             distancia_metros=0.0,   # no disponible en SELECT simple
-            timestamp_medicion=l["timestamp_medicion"],
+            timestamp_medicion=lec["timestamp_medicion"],
         )
     return Reporte(
         id=row["id"],

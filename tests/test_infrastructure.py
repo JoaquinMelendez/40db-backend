@@ -1,5 +1,4 @@
 import os
-import sys
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -15,7 +14,7 @@ os.environ.setdefault("MQTT_USER", "test-user")
 os.environ.setdefault("MQTT_PASSWORD", "test-password")
 
 import pytest
-from app.domain.entities import Usuario, Sensor, Reporte, ReporteArchivoAdmin, ResumenHorario, EvidenciaIot
+from app.domain.entities import EvidenciaIot
 from app.domain.errors import ExternalServiceError
 from app.infrastructure.db.sensor_repo import SensorNombreDuplicadoError
 

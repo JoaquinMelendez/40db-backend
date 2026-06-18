@@ -14,7 +14,7 @@ def obtener_heatmap(
     bucket_minutes: int,
 ) -> tuple[list[dict], str]:
     """Devuelve (rows, fuente). fuente ∈ {"matview","rpc"} — ver lectura_repo."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     if bucket_minutes not in BUCKET_MINUTES_PERMITIDOS:
         raise ValidationError(f"bucket_minutes debe ser uno de {sorted(BUCKET_MINUTES_PERMITIDOS)}.")

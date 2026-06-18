@@ -1,7 +1,7 @@
 from typing import Optional
 from app.domain.entities import Reporte, Usuario
 from app.domain.errors import (
-    ReporteNotFoundError, ForbiddenError, ComunaMismatchError,
+    ReporteNotFoundError, ComunaMismatchError,
     InvalidStateTransitionError, ValidationError,
 )
 

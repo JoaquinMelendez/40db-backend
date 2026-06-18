@@ -19,7 +19,6 @@ from app.api.schemas.reporte_archivo_admin import (
     ReporteArchivoAdminResponse,
 )
 from app.domain.entities import ReporteArchivoAdmin, Usuario
-from app.domain.errors import ValidationError
 
 router = APIRouter(prefix="/reportes-admin/archivos", tags=["reportes-admin"])
 
