@@ -15,7 +15,8 @@ Punto de entrada a la documentación del backend. Está pensada como **especific
 | 5 | [`errores.md`](./errores.md) | Jerarquía de excepciones de dominio, mapeo HTTP, health checks, manejo de fallos externos. |
 | 6 | [`iot.md`](./iot.md) | Contrato MQTT con el subsistema IoT (lo implementa otro miembro del equipo). |
 | 7 | [`PLAN.md`](./PLAN.md) | **Orden de implementación con dependencias.** Esto es lo que se ejecuta. |
-| 8 | [`frontend-resumen-horario.md`](./frontend-resumen-horario.md) | Instrucciones para que el frontend Vue 3 integre el endpoint `/lecturas/resumen` + heatmap optimizado (capa OLAP — ADR 09). |
+| 8 | [`testing.md`](./testing.md) | Suite de pruebas: layout, cómo correrla, cobertura y CI. |
+| 9 | [`frontend-resumen-horario.md`](./frontend-resumen-horario.md) | Instrucciones para que el frontend Vue 3 integre el endpoint `/lecturas/resumen` + heatmap optimizado (capa OLAP — ADR 09). |
 
 ---
 
@@ -54,6 +55,7 @@ Si encontrás una contradicción, **corregí el doc menos específico** para que
 | `errores.md` | ✅ ratificado | — |
 | `iot.md` | 🟡 propuesta | Contrato sugerido al equipo IoT, sujeto a confirmación con compañero |
 | `PLAN.md` | ✅ ratificado | Path crítico al MVP |
+| `testing.md` | ✅ vigente | 251 tests, 96% cobertura, CI con ruff+pytest |
 | `patterns.md` | ⏸ postergado | Patrones se concretarán al implementar; ver `backend.md` §6 |
 
 ---
