@@ -5,9 +5,8 @@ Reglas de autorización:
 - municipalidad: solo sensores de su comuna_id.
 """
 from datetime import datetime, timedelta
-from typing import Optional
 
-from app.domain.entities import ResumenHorario, Sensor, Usuario
+from app.domain.entities import Usuario
 from app.domain.errors import ComunaMismatchError, NotFoundError, ValidationError
 from app.infrastructure.db.resumen_horario_repo import ResumenHorarioRepository
 from app.infrastructure.db.sensor_repo import SensorRepository

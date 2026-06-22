@@ -10,4 +10,6 @@ python-multipart
 # Dev / test
 pytest
 pytest-asyncio
+pytest-cov
 httpx
+ruff==0.15.18

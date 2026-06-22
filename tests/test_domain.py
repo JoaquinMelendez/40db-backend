@@ -7,9 +7,8 @@ os.environ.setdefault("CORS_ORIGINS", "http://localhost:5173")
 
 import pytest
 from app.domain.errors import (
-    DomainError, NotFoundError, ForbiddenError, InvalidTokenError,
-    ReporteNotFoundError, ComunaMismatchError, InvalidStateTransitionError,
-    ExternalServiceError, ValidationError,
+    DomainError, NotFoundError, InvalidTokenError,
+    ReporteNotFoundError, ComunaMismatchError, ExternalServiceError,
 )
 from app.application.cambiar_estado_reporte import _TRANSICIONES_VALIDAS
 

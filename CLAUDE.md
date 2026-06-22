@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo state vs. docs
 
-**Important: the code is a near-empty scaffold; the architecture lives in `docs/`.** Both `main.py` (root) and `app/main.py` are stub FastAPI apps with a single hola-mundo endpoint. Every folder under `app/` is a `.gitkeep` placeholder. There are no tests, no models, no use cases yet.
+**The MVP backend is implemented; the docs remain the spec.** `app/` holds the full hexagonal-lite layout (domain, application, infrastructure, api, core) with the 29 endpoints of `api.md`, the MQTT ingestor, and a test suite of **251 tests at 96% coverage** (see `docs/testing.md`). The root `main.py` is still a hola-mundo stub kept only as a dev shortcut; **`app/main.py` is the real entrypoint**. The docs in `docs/` are still authoritative: when code and a doc disagree, fix the authoritative doc and the code together (see precedence rules in `docs/README.md`).
 
 **Start at `docs/README.md`** — it indexes the whole documentation set in reading order and defines precedence rules between docs.
 
@@ -19,10 +19,11 @@ Quick map (full index in `docs/README.md`):
 | `docs/auth.md` | Supabase Auth, JWT, role matrix, dependency sketches |
 | `docs/errores.md` | Domain exception hierarchy, HTTP mapping, health checks |
 | `docs/iot.md` | MQTT contract (IoT subsystem implemented by **another team member**) |
+| `docs/testing.md` | Test suite: layout, how to run, coverage, CI (`pytest` + `ruff`) |
 
 Docs are in Spanish; so are domain identifiers (`reporte`, `lectura`, `sensor`, `usuario`, `comuna`, `tipo_estado`, `historial_estado`). Keep this convention when adding code.
 
-**Target folder layout** (from `backend.md` §3) is hexagonal lite: `app/api/`, `app/application/`, `app/domain/`, `app/infrastructure/{db,mqtt}/`, `app/core/`, `app/patterns/`. The current scaffold uses older names. The migration table in `backend.md` §3 maps old → new. Migrate to the target layout as endpoints are implemented (paso 2 of `PLAN.md`), not as a separate refactor.
+**Folder layout** (from `backend.md` §3) is hexagonal lite and already in place: `app/api/`, `app/application/`, `app/domain/`, `app/infrastructure/{db,mqtt,storage}/`, `app/core/`, `app/patterns/`. The old scaffold names (`routes/`, `services/`, `repositories/`, …) have been migrated; the old → new mapping in `backend.md` §3 is now historical reference.
 
 ## Migration state warning
 
@@ -47,12 +48,17 @@ These are decisions that touch multiple files and are easy to violate accidental
 ## Commands
 
 ```bash
-# Dev server (FastAPI). Either entrypoint works — both are hola-mundo stubs today.
-uvicorn main:app --reload                # root main.py (dev shortcut)
-uvicorn app.main:app --reload            # app/main.py (will become the real entrypoint)
+# Dev server (FastAPI). app/main.py is the real entrypoint (routers + MQTT lifespan).
+uvicorn app.main:app --reload            # real app
+uvicorn main:app --reload                # root main.py: hola-mundo stub, dev shortcut only
 
-# Python deps
-pip install -r requirements.txt          # currently: fastapi, uvicorn[standard]
+# Python deps (runtime + dev/test, see requirements.txt)
+pip install -r requirements.txt
+
+# Tests + lint (full details in docs/testing.md)
+pytest                                   # full suite with coverage (config in pytest.ini)
+pytest -q                                # quiet, same as CI
+ruff check app/ tests/                   # lint (config in ruff.toml)
 
 # Supabase local stack (requires Supabase CLI)
 supabase start                           # boot Postgres + Auth + Studio (ports in supabase/config.toml)
@@ -69,4 +75,4 @@ Local Supabase ports (`supabase/config.toml`): API 54321, DB 54322, Studio 54323
 - **Language: Spanish** for domain names, comments, doc strings, and commit messages. Code identifiers follow Python style (`snake_case` for vars/functions, `PascalCase` for classes), but the *words* are Spanish (`crear_reporte`, `ReporteRepository`, `LecturaRepository`).
 - **Commit style** (from `git log`): `feat:`, `chore:`, `add:`, `fix:` prefixes, lowercase, Spanish.
 - **Python version**: docs say 3.11+; actual runtime is **3.9.6** (system Python from macOS CommandLineTools, `pip3` installs to `~/Library/Python/3.9`). The `.pyc` artifact from 3.14 was a one-off; ignore it.
-- **No tests yet** — when adding the first one, set up `pytest` and put it under `tests/`. There is no test runner configured.
+- **Tests live under `tests/`** — `pytest` (config in `pytest.ini`), one file per layer, currently 251 tests at 96% coverage. Add new tests in the matching layer file and keep coverage from dropping. Lint with `ruff` (`ruff.toml`). CI runs both on every PR/push to `dev`/`main`. Full details in `docs/testing.md`.

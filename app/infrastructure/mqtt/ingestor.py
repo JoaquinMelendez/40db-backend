@@ -1,5 +1,4 @@
 import logging
-import threading
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +58,6 @@ class MqttIngestor:
 
     def _on_message(self, client, userdata, msg):
         import json
-        from datetime import datetime, timezone
 
         # Extraer sensor_id del topic: 40db/sensores/{sensor_id}/lectura
         parts = msg.topic.split("/")
