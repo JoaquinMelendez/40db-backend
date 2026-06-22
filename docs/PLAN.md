@@ -235,7 +235,7 @@ Antes de empezar cualquier paso:
 
 ---
 
-## Paso 9 — Tests mínimos
+## Paso 9 — Tests mínimos ✅ (implementado — superado)
 
 **Dependencias:** pasos previos según qué se teste.
 
@@ -247,6 +247,11 @@ Antes de empezar cualquier paso:
 - Tests de RPCs con `pgTAP` o queries directas (opcional pero recomendado).
 
 **Done when:** `pytest` corre verde con cobertura de happy paths.
+
+**Estado real (supera el mínimo):** la suite tiene **251 tests al 96 % de
+cobertura**, repartidos por capa (dominio, aplicación, infraestructura, API,
+smoke, integración, seguridad), más una prueba de carga k6 y CI con `ruff` +
+`pytest`. Detalle completo en [`testing.md`](./testing.md).
 
 ---
 
