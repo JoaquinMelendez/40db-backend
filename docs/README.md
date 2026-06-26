@@ -1,3 +1,64 @@
+# 40dB — Backend
+
+API del proyecto **40dB**: gestiona los reportes ciudadanos de ruido e ingiere la
+telemetría de los sensores IoT, cruzando ambas fuentes (validación geo-temporal con
+PostGIS) y generando los heatmaps acústicos que consume el frontend.
+
+> Parte del proyecto 40dB — TPY1101, Equipo 4, Sección 001D.
+> Repositorio de documentación: [AntecedentesProyecto40dB](https://github.com/JoaquinMelendez/AntecedentesProyecto40dB).
+
+## Tecnologías
+
+| Área | Stack |
+|------|-------|
+| Framework | FastAPI (Python) · Pydantic |
+| Base de datos | PostgreSQL + PostGIS (Supabase) |
+| IoT | MQTT (paho-mqtt) sobre HiveMQ |
+| Auth | JWT (Supabase Auth) |
+| Testing / QA | pytest · pytest-cov · k6 (carga) · ruff |
+| CI / Deploy | GitHub Actions · Render |
+
+## Arquitectura
+
+Arquitectura por capas / hexagonal (puertos y adaptadores):
+
+```
+app/
+  api/             Rutas HTTP, schemas, dependencias y middleware
+  application/     Casos de uso (crear_reporte, obtener_heatmap, sensores, ...)
+  domain/          Entidades, errores y puertos (interfaces)
+  infrastructure/  Adaptadores: db (Supabase/RPC), mqtt (ingestor), storage
+  core/            Configuración y cliente Supabase
+```
+
+Punto de entrada: `app.main:app`. Si las variables MQTT están configuradas, al arrancar
+se levanta el ingestor de sensores; si no, la API funciona igual sin IoT.
+
+## Puesta en marcha
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # completar credenciales (Supabase, MQTT, JWT)
+uvicorn app.main:app --reload
+```
+
+## Base de datos
+
+Esquema (tablas, triggers, RPCs) y datos de prueba en `supabase/`:
+
+```bash
+supabase db reset             # aplica migraciones + carga seed.sql
+```
+
+## Pruebas
+
+```bash
+pytest                        # unitarias, integración y seguridad (~96% cobertura)
+k6 run tests/load/load_test.js
+```
+
+---
+
 # Documentación — 40dB Backend
 
 Punto de entrada a la documentación del backend. Está pensada como **especificación accionable**: leyendo este folder en orden, una IA o desarrollador debe poder implementar el MVP sin información externa.
